@@ -1,0 +1,16 @@
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 8787,
+  "admin_key": "change-me-admin-key",
+  "database_path": "state/local_api_relay.sqlite3",
+  "idle_window_seconds": 300,
+  "request_timeout_seconds": 120,
+  "apps": [
+    {
+      "app_id": "chatbox",
+      "local_key": "local-chatbox-key",
+      "upstream_base_url": "https://api.openai.com",
+      "upstream_api_key": "sk-your-real-upstream-key"
+    }
+  ]
+}
