@@ -1,0 +1,11 @@
+[Unit]
+Description=Run OpenClaw task watchdog every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=openclaw-watchdog.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

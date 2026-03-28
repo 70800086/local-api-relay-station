@@ -1,0 +1,22 @@
+stock-score/
+out/
+tmp/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime / local state
+state/
+.openclaw/
+.learnings/
+
+# Personal memory and local notes
+MEMORY.md
+USER.md
+memory/
+
+# Local tooling noise
+.clawhub/
+skills/.skills_store_lock.json

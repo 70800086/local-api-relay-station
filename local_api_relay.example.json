@@ -1,0 +1,54 @@
+{
+  "server": {
+    "listen_host": "127.0.0.1",
+    "listen_port": 8787,
+    "admin_key": "change-me-admin-key",
+    "database_path": "state/local_api_relay.sqlite3",
+    "idle_window_seconds": 300,
+    "request_timeout_seconds": 120
+  },
+  "local": {
+    "clients": [
+      {
+        "client_id": "chatbox",
+        "local_key": "local-chatbox-key"
+      }
+    ]
+  },
+  "upstreams": {
+    "primary-openai": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "sk-primary-upstream-key",
+      "enabled": true,
+      "transport": {
+        "timeout_seconds": 120
+      },
+      "models": {
+        "gpt-5.4": "gpt-5.4",
+        "gpt-4o-mini": "gpt-4o-mini"
+      }
+    },
+    "backup-openai": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "sk-backup-upstream-key",
+      "enabled": true,
+      "transport": {
+        "timeout_seconds": 120
+      },
+      "models": {
+        "gpt-5.4": "gpt-5.4",
+        "gpt-4o-mini": "gpt-4o-mini"
+      }
+    }
+  },
+  "model_groups": {
+    "gpt-5.4": [
+      "primary-openai",
+      "backup-openai"
+    ],
+    "gpt-4o-mini": [
+      "primary-openai",
+      "backup-openai"
+    ]
+  }
+}
