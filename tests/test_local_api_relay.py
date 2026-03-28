@@ -94,28 +94,15 @@ def make_config_payload(
                 "api_key": "upstream-primary-key",
                 "enabled": True,
                 "transport": {"timeout_seconds": 120},
-                "models": {
-                    "gpt-test": "primary-gpt-test",
-                    "gpt-shared": "primary-gpt-shared",
-                },
             },
             "backup": {
                 "base_url": upstream_base_urls["backup"],
                 "api_key": "upstream-backup-key",
                 "enabled": True,
                 "transport": {"timeout_seconds": 120},
-                "models": {
-                    "gpt-test": "backup-gpt-test",
-                    "gpt-alt": "backup-gpt-alt",
-                    "gpt-shared": "backup-gpt-shared",
-                },
             },
         },
-        "model_groups": {
-            "gpt-test": ["primary", "backup"],
-            "gpt-alt": ["backup"],
-            "gpt-shared": ["primary", "backup"],
-        },
+        "order": ["primary", "backup"],
     }
 
 
@@ -250,9 +237,9 @@ class RelayPlanningTests(unittest.TestCase):
         self.assertEqual(config.listen_port, 8787)
         self.assertEqual(config.local_clients_by_key["local-chat-key"].client_id, "chat-client")
         self.assertEqual(config.upstreams_by_id["primary"].api_key, "upstream-primary-key")
-        self.assertEqual(config.model_groups["gpt-test"], ["primary", "backup"])
+        self.assertEqual(config.order, ["primary", "backup"])
 
-    def test_plan_request_attempts_uses_model_group_order(self) -> None:
+    def test_plan_request_attempts_uses_global_order_and_preserves_request_body(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             payload = make_config_payload(
                 listen_port=8787,
@@ -260,93 +247,107 @@ class RelayPlanningTests(unittest.TestCase):
             )
             config = relay.RelayConfig.load(self.write_config(tmp_dir, payload))
 
+        request_body = b'{"model":"gpt-test","messages":[]}'
         plan = relay.plan_request_attempts(
             config,
             headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
-            request_body=b'{"model":"gpt-test","messages":[]}',
+            request_body=request_body,
         )
 
         self.assertIsNone(plan.error_status)
         self.assertEqual(plan.client.client_id, "chat-client")
-        self.assertEqual(plan.canonical_model, "gpt-test")
+        self.assertEqual(plan.requested_model, "gpt-test")
         self.assertEqual([attempt.upstream.upstream_id for attempt in plan.attempts], ["primary", "backup"])
-        self.assertEqual(plan.attempts[0].upstream_model, "primary-gpt-test")
-        self.assertEqual(
-            json.loads(plan.attempts[1].request_body.decode("utf-8"))["model"],
-            "backup-gpt-test",
-        )
+        self.assertTrue(all(attempt.request_body == request_body for attempt in plan.attempts))
 
-    def test_plan_request_attempts_skips_disabled_and_unsupported_upstreams(self) -> None:
+    def test_plan_request_attempts_skips_disabled_upstreams_and_allows_missing_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             payload = make_config_payload(
                 listen_port=8787,
                 database_path=str(Path(tmp_dir) / "relay.sqlite3"),
             )
-            payload["model_groups"]["gpt-alt"] = ["primary", "backup"]
             payload["upstreams"]["primary"]["enabled"] = False
             config = relay.RelayConfig.load(self.write_config(tmp_dir, payload))
 
         plan = relay.plan_request_attempts(
             config,
             headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
-            request_body=b'{"model":"gpt-alt"}',
+            request_body=b'{"messages":[]}',
         )
 
         self.assertIsNone(plan.error_status)
+        self.assertIsNone(plan.requested_model)
         self.assertEqual([attempt.upstream.upstream_id for attempt in plan.attempts], ["backup"])
-        self.assertEqual(plan.attempts[0].upstream_model, "backup-gpt-alt")
 
-    def test_plan_request_attempts_rejects_missing_model_group_and_missing_support(self) -> None:
+    def test_plan_request_attempts_rejects_invalid_local_key_and_missing_enabled_upstreams(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             payload = make_config_payload(
                 listen_port=8787,
                 database_path=str(Path(tmp_dir) / "relay.sqlite3"),
             )
-            missing_group_config = relay.RelayConfig.load(self.write_config(tmp_dir, payload))
+            config = relay.RelayConfig.load(self.write_config(tmp_dir, payload))
 
-            payload_without_support = make_config_payload(
+            disabled_payload = make_config_payload(
                 listen_port=8787,
                 database_path=str(Path(tmp_dir) / "relay-2.sqlite3"),
             )
-            payload_without_support["upstreams"]["primary"]["enabled"] = False
-            payload_without_support["upstreams"]["backup"]["models"].pop("gpt-test")
-            unsupported_config = relay.RelayConfig.load(
-                self.write_config(tmp_dir, payload_without_support)
-            )
+            disabled_payload["upstreams"]["primary"]["enabled"] = False
+            disabled_payload["upstreams"]["backup"]["enabled"] = False
+            disabled_config = relay.RelayConfig.load(self.write_config(tmp_dir, disabled_payload))
 
-        missing_group_plan = relay.plan_request_attempts(
-            missing_group_config,
-            headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
-            request_body=b'{"model":"gpt-missing"}',
+        invalid_key_plan = relay.plan_request_attempts(
+            config,
+            headers={"Authorization": "Bearer wrong-key", "Content-Type": "application/json"},
+            request_body=b'{"model":"gpt-test"}',
         )
-        unsupported_plan = relay.plan_request_attempts(
-            unsupported_config,
+        missing_upstreams_plan = relay.plan_request_attempts(
+            disabled_config,
             headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
             request_body=b'{"model":"gpt-test"}',
         )
-        missing_model_plan = relay.plan_request_attempts(
-            unsupported_config,
-            headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
-            request_body=b'{"messages":[]}',
+
+        self.assertEqual(invalid_key_plan.error_status, 401)
+        self.assertEqual(invalid_key_plan.error_kind, "invalid_local_key")
+        self.assertEqual(invalid_key_plan.attempts, [])
+
+        self.assertEqual(missing_upstreams_plan.error_status, 502)
+        self.assertEqual(missing_upstreams_plan.error_kind, "no_enabled_upstreams")
+        self.assertEqual(missing_upstreams_plan.attempts, [])
+
+    def test_should_retry_with_fallback_only_for_5xx_and_obvious_model_mismatch_4xx(self) -> None:
+        self.assertTrue(relay._should_retry_with_fallback(500, "", b"", "gpt-test"))
+        self.assertTrue(
+            relay._should_retry_with_fallback(
+                400,
+                "application/json",
+                b'{"error":{"message":"Model gpt-test is not supported here"}}',
+                "gpt-test",
+            )
         )
-
-        self.assertEqual(missing_group_plan.error_status, 400)
-        self.assertEqual(missing_group_plan.error_kind, "model_not_configured")
-        self.assertEqual(missing_group_plan.attempts, [])
-
-        self.assertEqual(unsupported_plan.error_status, 400)
-        self.assertEqual(unsupported_plan.error_kind, "model_not_supported")
-        self.assertEqual(unsupported_plan.attempts, [])
-
-        self.assertEqual(missing_model_plan.error_status, 400)
-        self.assertEqual(missing_model_plan.error_kind, "missing_model")
-        self.assertEqual(missing_model_plan.attempts, [])
-
-    def test_should_retry_with_fallback_only_for_upstream_5xx(self) -> None:
-        self.assertTrue(relay._should_retry_with_fallback(500))
-        self.assertTrue(relay._should_retry_with_fallback(503))
-        self.assertFalse(relay._should_retry_with_fallback(429))
-        self.assertFalse(relay._should_retry_with_fallback(400))
+        self.assertTrue(
+            relay._should_retry_with_fallback(
+                404,
+                "application/json",
+                b'{"error":{"message":"No such model: gpt-test"}}',
+                "gpt-test",
+            )
+        )
+        self.assertFalse(
+            relay._should_retry_with_fallback(
+                403,
+                "application/json",
+                b'{"error":{"message":"Your request was blocked."}}',
+                "gpt-test",
+            )
+        )
+        self.assertFalse(
+            relay._should_retry_with_fallback(
+                400,
+                "application/json",
+                b'{"error":{"message":"bad request"}}',
+                "gpt-test",
+            )
+        )
 
 
 class RelayStoreTests(unittest.TestCase):
@@ -360,8 +361,7 @@ class RelayStoreTests(unittest.TestCase):
                     finished_at=start,
                     client_id="chat-client",
                     upstream_id="primary",
-                    canonical_model="gpt-test",
-                    upstream_model="primary-gpt-test",
+                    requested_model="gpt-test",
                     method="POST",
                     path="/v1/chat/completions",
                     status_code=201,
@@ -379,8 +379,7 @@ class RelayStoreTests(unittest.TestCase):
                     finished_at=start,
                     client_id="chat-client",
                     upstream_id="backup",
-                    canonical_model="gpt-test",
-                    upstream_model="backup-gpt-test",
+                    requested_model="gpt-test",
                     method="POST",
                     path="/v1/chat/completions",
                     status_code=503,
@@ -398,8 +397,7 @@ class RelayStoreTests(unittest.TestCase):
                     finished_at=start,
                     client_id=None,
                     upstream_id=None,
-                    canonical_model="gpt-test",
-                    upstream_model=None,
+                    requested_model="gpt-test",
                     method="POST",
                     path="/v1/chat/completions",
                     status_code=401,
@@ -430,10 +428,7 @@ class RelayStoreTests(unittest.TestCase):
         self.assertEqual(upstream_stats["backup"]["failures"], 1)
         model_stats = {item["model"]: item for item in stats["models"]}
         self.assertEqual(model_stats["gpt-test"]["requests"], 2)
-        self.assertEqual(
-            model_stats["gpt-test"]["upstream_models"],
-            {"backup-gpt-test": 1, "primary-gpt-test": 1},
-        )
+        self.assertNotIn("upstream_models", model_stats["gpt-test"])
 
 
 class LocalApiRelayIntegrationTests(unittest.TestCase):
@@ -456,12 +451,12 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
             config_path = self.write_config(tmp_dir, payload)
             RecordingUpstreamHandler.queue_responses(
                 {
-                    "status": 503,
+                    "status": 400,
                     "headers": {
                         "Content-Type": "application/json",
-                        "X-Upstream-Trace": "primary-503",
+                        "X-Upstream-Trace": "primary-unsupported",
                     },
-                    "body": b'{"error":{"message":"primary down"}}',
+                    "body": b'{"error":{"message":"Model gpt-test is not supported here"}}',
                 },
                 {
                     "status": 201,
@@ -481,7 +476,7 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
                 health = json.loads(health_payload)
                 self.assertEqual(health["status"], "ok")
                 self.assertEqual(health["local"]["clients"], ["chat-client"])
-                self.assertEqual(health["model_groups"]["gpt-test"], ["primary", "backup"])
+                self.assertEqual(health["order"], ["primary", "backup"])
                 self.assertEqual(
                     [item["upstream_id"] for item in health["upstreams"]],
                     ["backup", "primary"],
@@ -498,6 +493,7 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
                 self.assertTrue(idle["idle"])
                 self.assertEqual(idle["reason"], "no_recent_requests")
 
+                request_body = b'{"model":"gpt-test","messages":[]}'
                 status, headers, payload = make_request(
                     relay_port,
                     "POST",
@@ -506,7 +502,7 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
                         "Authorization": "Bearer local-chat-key",
                         "Content-Type": "application/json",
                     },
-                    body=b'{"model":"gpt-test","messages":[]}',
+                    body=request_body,
                 )
                 self.assertEqual(status, 201)
                 self.assertEqual(headers.get("x-upstream-trace"), "stub-1")
@@ -522,10 +518,8 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
                     RecordingUpstreamHandler.requests[1]["headers"]["authorization"],
                     "Bearer upstream-backup-key",
                 )
-                self.assertEqual(
-                    json.loads(RecordingUpstreamHandler.requests[1]["body"].decode("utf-8"))["model"],
-                    "backup-gpt-test",
-                )
+                self.assertEqual(RecordingUpstreamHandler.requests[0]["body"], request_body)
+                self.assertEqual(RecordingUpstreamHandler.requests[1]["body"], request_body)
 
                 stats_status, _, stats_payload = make_request(
                     relay_port,
@@ -539,7 +533,7 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
                 self.assertEqual(stats["totals"]["successes"], 1)
                 self.assertEqual(stats["totals"]["failures"], 1)
                 upstream_stats = {item["upstream_id"]: item for item in stats["upstreams"]}
-                self.assertEqual(upstream_stats["primary"]["status_codes"], {"503": 1})
+                self.assertEqual(upstream_stats["primary"]["status_codes"], {"400": 1})
                 self.assertEqual(upstream_stats["backup"]["status_codes"], {"201": 1})
                 self.assertEqual(stats["clients"][0]["client_id"], "chat-client")
                 self.assertEqual(stats["models"][0]["model"], "gpt-test")
@@ -554,6 +548,61 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
                 idle = json.loads(idle_payload)
                 self.assertFalse(idle["idle"])
                 self.assertEqual(idle["reason"], "recent_successful_requests")
+
+    def test_last_meaningful_error_is_returned_when_later_upstreams_only_hit_gateway_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+            relay_port = find_free_port()
+            unreachable_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                upstream_base_urls={
+                    "primary": f"http://127.0.0.1:{upstream.port}/primary",
+                    "backup": f"http://127.0.0.1:{unreachable_port}/backup",
+                },
+            )
+            config_path = self.write_config(tmp_dir, payload)
+            RecordingUpstreamHandler.queue_responses(
+                {
+                    "status": 404,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "X-Upstream-Trace": "primary-no-model",
+                    },
+                    "body": b'{"error":{"message":"No such model: gpt-test"}}',
+                }
+            )
+
+            with RelayServer(config_path):
+                status, headers, payload = make_request(
+                    relay_port,
+                    "POST",
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=b'{"model":"gpt-test","messages":[]}',
+                )
+                self.assertEqual(status, 404)
+                self.assertEqual(headers.get("x-upstream-trace"), "primary-no-model")
+                self.assertEqual(
+                    json.loads(payload)["error"]["message"],
+                    "No such model: gpt-test",
+                )
+                self.assertEqual(len(RecordingUpstreamHandler.requests), 1)
+
+                stats_status, _, stats_payload = make_request(
+                    relay_port,
+                    "GET",
+                    "/_relay/stats",
+                    headers={"X-Relay-Admin-Key": "relay-admin"},
+                )
+                self.assertEqual(stats_status, 200)
+                stats = json.loads(stats_payload)
+                self.assertEqual(stats["totals"]["requests"], 2)
+                self.assertEqual(stats["totals"]["successes"], 0)
+                self.assertEqual(stats["totals"]["failures"], 2)
 
     def test_admin_endpoints_require_admin_key_and_invalid_local_key_is_counted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
@@ -599,13 +648,7 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
                 self.assertEqual(stats["totals"]["local_rejects"], 1)
                 self.assertEqual(stats["clients"], [])
                 self.assertEqual(stats["upstreams"], [])
-                if stats["models"]:
-                    self.assertEqual([item["model"] for item in stats["models"]], ["gpt-test"])
-                    self.assertEqual(stats["models"][0]["requests"], 0)
-                    self.assertEqual(stats["models"][0]["successes"], 0)
-                    self.assertEqual(stats["models"][0]["failures"], 0)
-                else:
-                    self.assertEqual(stats["models"], [])
+                self.assertEqual(stats["models"], [])
 
 
 if __name__ == "__main__":

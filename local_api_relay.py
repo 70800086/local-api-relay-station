@@ -27,7 +27,7 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 CAPTURE_BODY_LIMIT = 1_000_000
-REQUEST_LOG_TABLE = "request_log_v3"
+REQUEST_LOG_TABLE = "request_log_v4"
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
@@ -42,7 +42,6 @@ class UpstreamConfig:
     upstream_id: str
     base_url: str
     api_key: str
-    models: dict[str, str]
     enabled: bool
     transport: dict[str, Any]
 
@@ -56,18 +55,25 @@ class UpstreamConfig:
 @dataclass(frozen=True)
 class PlannedUpstreamRequest:
     upstream: UpstreamConfig
-    upstream_model: str
     request_body: bytes
 
 
 @dataclass(frozen=True)
 class RequestPlan:
     client: LocalClientConfig | None
-    canonical_model: str | None
+    requested_model: str | None
     attempts: list[PlannedUpstreamRequest]
     error_status: int | None = None
     error_kind: str | None = None
     error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class StoredUpstreamError:
+    status_code: int
+    reason: str
+    headers: list[tuple[str, str]]
+    body: bytes
 
 
 @dataclass(frozen=True)
@@ -80,7 +86,7 @@ class RelayConfig:
     request_timeout_seconds: int
     local_clients: list[LocalClientConfig]
     upstreams: list[UpstreamConfig]
-    model_groups: dict[str, list[str]]
+    order: list[str]
 
     @property
     def local_clients_by_key(self) -> dict[str, LocalClientConfig]:
@@ -99,7 +105,7 @@ class RelayConfig:
         server_payload = _as_dict(payload.get("server"), "server")
         local_payload = _as_dict(payload.get("local"), "local")
         upstreams_payload = _as_dict(payload.get("upstreams"), "upstreams")
-        model_groups_payload = _as_dict(payload.get("model_groups"), "model_groups")
+        order_payload = _as_list(payload.get("order"), "order")
 
         local_clients = [
             LocalClientConfig(
@@ -119,31 +125,18 @@ class RelayConfig:
                     upstream_id=str(upstream_id),
                     base_url=str(upstream_payload["base_url"]),
                     api_key=str(upstream_payload["api_key"]),
-                    models={
-                        str(model_id): str(upstream_model)
-                        for model_id, upstream_model in _as_dict(
-                            upstream_payload.get("models"),
-                            f"upstreams.{upstream_id}.models",
-                        ).items()
-                    },
                     enabled=_as_bool(upstream_payload.get("enabled", True)),
                     transport=_coerce_dict(upstream_payload.get("transport")),
                 )
             )
+        _ensure_unique([upstream.upstream_id for upstream in upstreams], "upstream_id")
 
-        upstream_ids = [upstream.upstream_id for upstream in upstreams]
-        _ensure_unique(upstream_ids, "upstream_id")
         upstreams_by_id = {upstream.upstream_id: upstream for upstream in upstreams}
-
-        model_groups: dict[str, list[str]] = {}
-        for model_id, raw_group in model_groups_payload.items():
-            upstream_group = [str(upstream_id) for upstream_id in _as_list(raw_group, f"model_groups.{model_id}")]
-            for upstream_id in upstream_group:
-                if upstream_id not in upstreams_by_id:
-                    raise ValueError(
-                        f"model group {model_id} references unknown upstream {upstream_id}"
-                    )
-            model_groups[str(model_id)] = upstream_group
+        order = [str(item) for item in order_payload]
+        _ensure_unique(order, "order")
+        for upstream_id in order:
+            if upstream_id not in upstreams_by_id:
+                raise ValueError(f"order references unknown upstream {upstream_id}")
 
         database_path = Path(server_payload.get("database_path") or "state/local_api_relay.sqlite3")
         return cls(
@@ -155,7 +148,7 @@ class RelayConfig:
             request_timeout_seconds=int(server_payload.get("request_timeout_seconds") or 120),
             local_clients=local_clients,
             upstreams=upstreams,
-            model_groups=model_groups,
+            order=order,
         )
 
 
@@ -179,8 +172,7 @@ class UsageStore:
                     finished_at TEXT NOT NULL,
                     client_id TEXT,
                     upstream_id TEXT,
-                    canonical_model TEXT,
-                    upstream_model TEXT,
+                    requested_model TEXT,
                     method TEXT NOT NULL,
                     path TEXT NOT NULL,
                     status_code INTEGER NOT NULL,
@@ -205,7 +197,7 @@ class UsageStore:
                 f"CREATE INDEX IF NOT EXISTS idx_{REQUEST_LOG_TABLE}_upstream_finished_at ON {REQUEST_LOG_TABLE}(upstream_id, finished_at)"
             )
             self.connection.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_{REQUEST_LOG_TABLE}_model_finished_at ON {REQUEST_LOG_TABLE}(canonical_model, finished_at)"
+                f"CREATE INDEX IF NOT EXISTS idx_{REQUEST_LOG_TABLE}_model_finished_at ON {REQUEST_LOG_TABLE}(requested_model, finished_at)"
             )
             self.connection.commit()
 
@@ -217,25 +209,25 @@ class UsageStore:
         self,
         client_id: str | None,
         upstream_id: str | None,
-        canonical_model: str | None,
+        requested_model: str | None,
     ) -> None:
         with self.lock:
             self.active_requests += 1
             _increment_counter(self.active_requests_by_client, client_id)
             _increment_counter(self.active_requests_by_upstream, upstream_id)
-            _increment_counter(self.active_requests_by_model, canonical_model)
+            _increment_counter(self.active_requests_by_model, requested_model)
 
     def request_finished(
         self,
         client_id: str | None,
         upstream_id: str | None,
-        canonical_model: str | None,
+        requested_model: str | None,
     ) -> None:
         with self.lock:
             self.active_requests = max(0, self.active_requests - 1)
             _decrement_counter(self.active_requests_by_client, client_id)
             _decrement_counter(self.active_requests_by_upstream, upstream_id)
-            _decrement_counter(self.active_requests_by_model, canonical_model)
+            _decrement_counter(self.active_requests_by_model, requested_model)
 
     def record_request(
         self,
@@ -244,8 +236,7 @@ class UsageStore:
         finished_at: datetime,
         client_id: str | None,
         upstream_id: str | None,
-        canonical_model: str | None,
-        upstream_model: str | None,
+        requested_model: str | None,
         method: str,
         path: str,
         status_code: int,
@@ -266,8 +257,7 @@ class UsageStore:
                     finished_at,
                     client_id,
                     upstream_id,
-                    canonical_model,
-                    upstream_model,
+                    requested_model,
                     method,
                     path,
                     status_code,
@@ -279,15 +269,14 @@ class UsageStore:
                     prompt_tokens,
                     completion_tokens,
                     total_tokens
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _serialize_datetime(started_at),
                     _serialize_datetime(finished_at),
                     client_id,
                     upstream_id,
-                    canonical_model,
-                    upstream_model,
+                    requested_model,
                     method,
                     path,
                     status_code,
@@ -328,70 +317,48 @@ class UsageStore:
             ).fetchall()
             model_rows = self.connection.execute(
                 _dimension_summary_query(
-                    "canonical_model",
-                    "canonical_model IS NOT NULL AND client_id IS NOT NULL",
-                    "canonical_model",
+                    "requested_model",
+                    "requested_model IS NOT NULL AND client_id IS NOT NULL",
+                    "requested_model",
                 )
             ).fetchall()
             model_status_rows = self.connection.execute(
                 _dimension_status_query(
-                    "canonical_model",
-                    "canonical_model IS NOT NULL AND client_id IS NOT NULL",
-                    "canonical_model",
+                    "requested_model",
+                    "requested_model IS NOT NULL AND client_id IS NOT NULL",
+                    "requested_model",
                 )
-            ).fetchall()
-            model_upstream_rows = self.connection.execute(
-                f"""
-                SELECT canonical_model, upstream_model, COUNT(*) AS count
-                FROM {REQUEST_LOG_TABLE}
-                WHERE canonical_model IS NOT NULL
-                  AND client_id IS NOT NULL
-                  AND upstream_model IS NOT NULL
-                GROUP BY canonical_model, upstream_model
-                ORDER BY canonical_model ASC, upstream_model ASC
-                """
             ).fetchall()
             active_requests = self.active_requests
             active_requests_by_client = dict(self.active_requests_by_client)
             active_requests_by_upstream = dict(self.active_requests_by_upstream)
             active_requests_by_model = dict(self.active_requests_by_model)
 
-        totals = _build_summary_payload(
-            totals_row,
-            status_codes=_status_code_counts(totals_status_rows),
-            in_flight_requests=active_requests,
-            include_local_rejects=True,
-        )
-        clients = _build_dimension_summaries(
-            rows=client_rows,
-            status_rows=client_status_rows,
-            label_key="client_id",
-            active_counts=active_requests_by_client,
-        )
-        upstreams = _build_dimension_summaries(
-            rows=upstream_rows,
-            status_rows=upstream_status_rows,
-            label_key="upstream_id",
-            active_counts=active_requests_by_upstream,
-        )
-        upstream_models_by_model: dict[str, dict[str, int]] = {}
-        for row in model_upstream_rows:
-            canonical_model = str(row["canonical_model"])
-            upstream_model = str(row["upstream_model"])
-            upstream_models_by_model.setdefault(canonical_model, {})[upstream_model] = int(row["count"])
-        models = _build_dimension_summaries(
-            rows=model_rows,
-            status_rows=model_status_rows,
-            label_key="model",
-            active_counts=active_requests_by_model,
-            extra_by_id=upstream_models_by_model,
-            extra_key="upstream_models",
-        )
         return {
-            "totals": totals,
-            "clients": clients,
-            "upstreams": upstreams,
-            "models": models,
+            "totals": _build_summary_payload(
+                totals_row,
+                status_codes=_status_code_counts(totals_status_rows),
+                in_flight_requests=active_requests,
+                include_local_rejects=True,
+            ),
+            "clients": _build_dimension_summaries(
+                rows=client_rows,
+                status_rows=client_status_rows,
+                label_key="client_id",
+                active_counts=active_requests_by_client,
+            ),
+            "upstreams": _build_dimension_summaries(
+                rows=upstream_rows,
+                status_rows=upstream_status_rows,
+                label_key="upstream_id",
+                active_counts=active_requests_by_upstream,
+            ),
+            "models": _build_dimension_summaries(
+                rows=model_rows,
+                status_rows=model_status_rows,
+                label_key="model",
+                active_counts=active_requests_by_model,
+            ),
         }
 
     def idle_status(self, window_seconds: int) -> dict[str, Any]:
@@ -560,11 +527,10 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             "base_url": upstream.base_url,
                             "enabled": upstream.enabled,
                             "transport": upstream.transport,
-                            "models": upstream.models,
                         }
                         for upstream in sorted(self.relay_config.upstreams, key=lambda item: item.upstream_id)
                     ],
-                    "model_groups": self.relay_config.model_groups,
+                    "order": list(self.relay_config.order),
                 },
             )
             return
@@ -581,7 +547,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         plan = plan_request_attempts(self.relay_config, self.headers, original_request_body)
         client_id = plan.client.client_id if plan.client is not None else None
         initial_upstream_id = plan.attempts[0].upstream.upstream_id if plan.attempts else None
-        self.usage_store.request_started(client_id, initial_upstream_id, plan.canonical_model)
+        self.usage_store.request_started(client_id, initial_upstream_id, plan.requested_model)
         try:
             if plan.error_status is not None:
                 started_at = datetime.now(timezone.utc)
@@ -595,8 +561,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     finished_at=finished_at,
                     client_id=client_id,
                     upstream_id=None,
-                    canonical_model=plan.canonical_model,
-                    upstream_model=None,
+                    requested_model=plan.requested_model,
                     method=self.command,
                     path=self.path,
                     status_code=plan.error_status,
@@ -611,6 +576,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            last_meaningful_error: StoredUpstreamError | None = None
             for index, attempt in enumerate(plan.attempts):
                 attempt_started_at = datetime.now(timezone.utc)
                 parsed_target = urlsplit(_build_upstream_target(attempt.upstream.base_url, self.path))
@@ -636,16 +602,23 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     )
                     response = connection.getresponse()
 
-                    if _should_retry_with_fallback(int(response.status)) and index + 1 < len(plan.attempts):
-                        response_bytes = _discard_response_body(response)
+                    if response.status < 400 or _is_upgrade_response(self.headers, response):
+                        if _is_upgrade_response(self.headers, response):
+                            response_bytes = self._relay_upstream_upgrade(connection, response)
+                            captured_body = b""
+                        else:
+                            response_bytes, captured_body = self._relay_upstream_response(response)
                         finished_at = datetime.now(timezone.utc)
+                        prompt_tokens, completion_tokens, total_tokens = _extract_usage_metrics(
+                            response.getheader("Content-Type", ""),
+                            captured_body,
+                        )
                         self.usage_store.record_request(
                             started_at=attempt_started_at,
                             finished_at=finished_at,
                             client_id=client_id,
                             upstream_id=attempt.upstream.upstream_id,
-                            canonical_model=plan.canonical_model,
-                            upstream_model=attempt.upstream_model,
+                            requested_model=plan.requested_model,
                             method=self.command,
                             path=self.path,
                             status_code=int(response.status),
@@ -653,30 +626,33 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             request_bytes=len(attempt.request_body),
                             response_bytes=response_bytes,
                             upstream_ms=_duration_ms(attempt_started_at, finished_at),
-                            error_kind="upstream_status_fallback",
-                            prompt_tokens=None,
-                            completion_tokens=None,
-                            total_tokens=None,
+                            error_kind=None,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            total_tokens=total_tokens,
                         )
-                        continue
+                        return
 
-                    if _is_upgrade_response(self.headers, response):
-                        response_bytes = self._relay_upstream_upgrade(connection, response)
-                        captured_body = b""
-                    else:
-                        response_bytes, captured_body = self._relay_upstream_response(response)
+                    response_headers = response.getheaders()
+                    response_bytes, captured_body = _read_full_response_body(response)
                     finished_at = datetime.now(timezone.utc)
                     prompt_tokens, completion_tokens, total_tokens = _extract_usage_metrics(
                         response.getheader("Content-Type", ""),
                         captured_body,
                     )
+                    should_retry = _should_retry_with_fallback(
+                        int(response.status),
+                        response.getheader("Content-Type", ""),
+                        captured_body,
+                        plan.requested_model,
+                    )
+                    can_retry = should_retry and index + 1 < len(plan.attempts)
                     self.usage_store.record_request(
                         started_at=attempt_started_at,
                         finished_at=finished_at,
                         client_id=client_id,
                         upstream_id=attempt.upstream.upstream_id,
-                        canonical_model=plan.canonical_model,
-                        upstream_model=attempt.upstream_model,
+                        requested_model=plan.requested_model,
                         method=self.command,
                         path=self.path,
                         status_code=int(response.status),
@@ -684,61 +660,73 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         request_bytes=len(attempt.request_body),
                         response_bytes=response_bytes,
                         upstream_ms=_duration_ms(attempt_started_at, finished_at),
-                        error_kind=None,
+                        error_kind="upstream_status_fallback" if can_retry else None,
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         total_tokens=total_tokens,
                     )
+                    if can_retry:
+                        last_meaningful_error = StoredUpstreamError(
+                            status_code=int(response.status),
+                            reason=response.reason,
+                            headers=response_headers,
+                            body=captured_body,
+                        )
+                        continue
+                    self._relay_buffered_response(
+                        int(response.status),
+                        response.reason,
+                        response_headers,
+                        captured_body,
+                    )
                     return
                 except (OSError, TimeoutError, http.client.HTTPException):
                     finished_at = datetime.now(timezone.utc)
-                    if index + 1 < len(plan.attempts):
-                        self.usage_store.record_request(
-                            started_at=attempt_started_at,
-                            finished_at=finished_at,
-                            client_id=client_id,
-                            upstream_id=attempt.upstream.upstream_id,
-                            canonical_model=plan.canonical_model,
-                            upstream_model=attempt.upstream_model,
-                            method=self.command,
-                            path=self.path,
-                            status_code=502,
-                            forwarded=False,
-                            request_bytes=len(attempt.request_body),
-                            response_bytes=0,
-                            upstream_ms=_duration_ms(attempt_started_at, finished_at),
-                            error_kind="upstream_request_failed",
-                            prompt_tokens=None,
-                            completion_tokens=None,
-                            total_tokens=None,
-                        )
-                        continue
-                    response_bytes = self._send_json(502, {"error": {"message": "upstream request failed"}})
                     self.usage_store.record_request(
                         started_at=attempt_started_at,
                         finished_at=finished_at,
                         client_id=client_id,
                         upstream_id=attempt.upstream.upstream_id,
-                        canonical_model=plan.canonical_model,
-                        upstream_model=attempt.upstream_model,
+                        requested_model=plan.requested_model,
                         method=self.command,
                         path=self.path,
                         status_code=502,
                         forwarded=False,
                         request_bytes=len(attempt.request_body),
-                        response_bytes=response_bytes,
+                        response_bytes=0,
                         upstream_ms=_duration_ms(attempt_started_at, finished_at),
                         error_kind="upstream_request_failed",
                         prompt_tokens=None,
                         completion_tokens=None,
                         total_tokens=None,
                     )
+                    if index + 1 < len(plan.attempts):
+                        continue
+                    if last_meaningful_error is not None:
+                        self._relay_buffered_response(
+                            last_meaningful_error.status_code,
+                            last_meaningful_error.reason,
+                            last_meaningful_error.headers,
+                            last_meaningful_error.body,
+                        )
+                        return
+                    self._send_json(502, {"error": {"message": "upstream request failed"}})
                     return
                 finally:
                     if connection is not None:
                         connection.close()
+
+            if last_meaningful_error is not None:
+                self._relay_buffered_response(
+                    last_meaningful_error.status_code,
+                    last_meaningful_error.reason,
+                    last_meaningful_error.headers,
+                    last_meaningful_error.body,
+                )
+                return
+            self._send_json(502, {"error": {"message": "upstream request failed"}})
         finally:
-            self.usage_store.request_finished(client_id, initial_upstream_id, plan.canonical_model)
+            self.usage_store.request_finished(client_id, initial_upstream_id, plan.requested_model)
 
     def _relay_upstream_response(self, response: http.client.HTTPResponse) -> tuple[int, bytes]:
         upstream_headers = response.getheaders()
@@ -821,6 +809,27 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     total_bytes += len(chunk)
         return total_bytes
 
+    def _relay_buffered_response(
+        self,
+        status_code: int,
+        reason: str,
+        headers: list[tuple[str, str]],
+        body: bytes,
+    ) -> int:
+        expects_no_body = self.command == "HEAD" or status_code in {204, 304} or 100 <= status_code < 200
+        self.send_response(status_code, reason)
+        for key, value in headers:
+            lowered = key.lower()
+            if lowered in HOP_BY_HOP_HEADERS or lowered == "content-length":
+                continue
+            self.send_header(key, value)
+        self.send_header("Content-Length", "0" if expects_no_body else str(len(body)))
+        self.end_headers()
+        if not expects_no_body:
+            self.wfile.write(body)
+            self.wfile.flush()
+        return 0 if expects_no_body else len(body)
+
     def _read_request_body(self) -> bytes:
         content_length = int(self.headers.get("Content-Length", "0"))
         if content_length <= 0:
@@ -840,87 +849,82 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
 
 
 def plan_request_attempts(config: RelayConfig, headers: Any, request_body: bytes) -> RequestPlan:
-    payload, canonical_model = _parse_canonical_request_body(request_body)
     local_key = _extract_local_key(headers)
     client = config.local_clients_by_key.get(local_key or "")
+    _, requested_model = _parse_request_body(request_body)
     if client is None:
         return RequestPlan(
             client=None,
-            canonical_model=canonical_model,
+            requested_model=requested_model,
             attempts=[],
             error_status=401,
             error_kind="invalid_local_key",
             error_message="invalid local api key",
         )
 
-    if canonical_model is None:
-        return RequestPlan(
-            client=client,
-            canonical_model=None,
-            attempts=[],
-            error_status=400,
-            error_kind="missing_model",
-            error_message="request body must include a canonical model",
-        )
-
-    upstream_ids = config.model_groups.get(canonical_model)
-    if not upstream_ids:
-        return RequestPlan(
-            client=client,
-            canonical_model=canonical_model,
-            attempts=[],
-            error_status=400,
-            error_kind="model_not_configured",
-            error_message="model has no configured upstream group",
-        )
-
     attempts: list[PlannedUpstreamRequest] = []
     seen_upstream_ids: set[str] = set()
-    for upstream_id in upstream_ids:
+    for upstream_id in config.order:
         if not upstream_id or upstream_id in seen_upstream_ids:
             continue
         seen_upstream_ids.add(upstream_id)
         upstream = config.upstreams_by_id[upstream_id]
         if not upstream.enabled:
             continue
-        rewritten_body, upstream_model, supported = _rewrite_request_body_for_upstream(
-            request_body,
-            payload,
-            canonical_model,
-            upstream,
-        )
-        if not supported or upstream_model is None:
-            continue
-        attempts.append(
-            PlannedUpstreamRequest(
-                upstream=upstream,
-                upstream_model=upstream_model,
-                request_body=rewritten_body,
-            )
-        )
+        attempts.append(PlannedUpstreamRequest(upstream=upstream, request_body=request_body))
 
     if attempts:
         return RequestPlan(
             client=client,
-            canonical_model=canonical_model,
+            requested_model=requested_model,
             attempts=attempts,
         )
 
     return RequestPlan(
         client=client,
-        canonical_model=canonical_model,
+        requested_model=requested_model,
         attempts=[],
-        error_status=400,
-        error_kind="model_not_supported",
-        error_message="no enabled upstream supports this model",
+        error_status=502,
+        error_kind="no_enabled_upstreams",
+        error_message="no enabled upstreams configured",
     )
 
 
-def _should_retry_with_fallback(status_code: int) -> bool:
-    return status_code >= 500
+def _should_retry_with_fallback(
+    status_code: int,
+    content_type: str = "",
+    response_body: bytes = b"",
+    requested_model: str | None = None,
+) -> bool:
+    if status_code >= 500:
+        return True
+    if status_code < 400 or status_code >= 500:
+        return False
+    message = _extract_error_message(content_type, response_body).lower()
+    if not message:
+        return False
+    requested_model_lower = (requested_model or "").strip().lower()
+    model_hint = "model" in message or (requested_model_lower and requested_model_lower in message)
+    if not model_hint:
+        return False
+    markers = (
+        "unsupported model",
+        "not supported",
+        "no such model",
+        "unknown model",
+        "model not found",
+        "does not exist",
+        "not exist",
+        "invalid model",
+        "unrecognized model",
+        "model is unavailable",
+        "model unavailable",
+        "not available",
+    )
+    return any(marker in message for marker in markers)
 
 
-def _parse_canonical_request_body(request_body: bytes) -> tuple[dict[str, Any] | None, str | None]:
+def _parse_request_body(request_body: bytes) -> tuple[dict[str, Any] | None, str | None]:
     if not request_body:
         return None, None
     try:
@@ -935,25 +939,30 @@ def _parse_canonical_request_body(request_body: bytes) -> tuple[dict[str, Any] |
     return payload, model.strip()
 
 
-def _rewrite_request_body_for_upstream(
-    request_body: bytes,
-    payload: dict[str, Any] | None,
-    canonical_model: str,
-    upstream: UpstreamConfig,
-) -> tuple[bytes, str | None, bool]:
-    upstream_model = upstream.models.get(canonical_model)
-    if upstream_model is None:
-        return request_body, None, False
-    if payload is None:
-        return request_body, upstream_model, True
-    rewritten_payload = dict(payload)
-    rewritten_payload["model"] = upstream_model
-    rewritten_body = json.dumps(
-        rewritten_payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return rewritten_body, upstream_model, True
+def _extract_error_message(content_type: str, body: bytes) -> str:
+    snippet = body[:CAPTURE_BODY_LIMIT]
+    if not snippet:
+        return ""
+    try:
+        text = snippet.decode("utf-8", errors="replace")
+    except Exception:
+        text = ""
+    if "json" not in content_type.lower():
+        return text
+    try:
+        payload = json.loads(snippet)
+    except json.JSONDecodeError:
+        return text
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str):
+                return message
+        message = payload.get("message")
+        if isinstance(message, str):
+            return message
+    return text
 
 
 def _duration_ms(started_at: datetime, finished_at: datetime) -> int:
@@ -1136,8 +1145,6 @@ def _build_dimension_summaries(
     status_rows: list[sqlite3.Row],
     label_key: str,
     active_counts: dict[str, int],
-    extra_by_id: dict[str, dict[str, int]] | None = None,
-    extra_key: str | None = None,
 ) -> list[dict[str, Any]]:
     status_codes_by_id: dict[str, dict[str, int]] = {}
     for row in status_rows:
@@ -1153,8 +1160,6 @@ def _build_dimension_summaries(
             in_flight_requests=active_counts.get(dimension_id, 0),
         )
         summary[label_key] = dimension_id
-        if extra_by_id is not None and extra_key is not None:
-            summary[extra_key] = extra_by_id.get(dimension_id, {})
         summaries_by_id[dimension_id] = summary
 
     for dimension_id, in_flight_requests in active_counts.items():
@@ -1162,8 +1167,6 @@ def _build_dimension_summaries(
             continue
         summary = _empty_summary_payload(in_flight_requests)
         summary[label_key] = dimension_id
-        if extra_by_id is not None and extra_key is not None:
-            summary[extra_key] = extra_by_id.get(dimension_id, {})
         summaries_by_id[dimension_id] = summary
 
     return [summaries_by_id[dimension_id] for dimension_id in sorted(summaries_by_id)]
@@ -1229,13 +1232,15 @@ def _empty_summary_payload(in_flight_requests: int) -> dict[str, Any]:
     }
 
 
-def _discard_response_body(response: http.client.HTTPResponse) -> int:
+def _read_full_response_body(response: http.client.HTTPResponse) -> tuple[int, bytes]:
+    chunks: list[bytes] = []
     total_bytes = 0
     while True:
         chunk = response.read(64 * 1024)
         if not chunk:
-            return total_bytes
+            return total_bytes, b"".join(chunks)
         total_bytes += len(chunk)
+        chunks.append(chunk)
 
 
 def _as_dict(value: Any, label: str) -> dict[str, Any]:

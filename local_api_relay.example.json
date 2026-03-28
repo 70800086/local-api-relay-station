@@ -22,10 +22,6 @@
       "enabled": true,
       "transport": {
         "timeout_seconds": 120
-      },
-      "models": {
-        "gpt-5.4": "gpt-5.4",
-        "gpt-4o-mini": "gpt-4o-mini"
       }
     },
     "backup-openai": {
@@ -34,21 +30,11 @@
       "enabled": true,
       "transport": {
         "timeout_seconds": 120
-      },
-      "models": {
-        "gpt-5.4": "gpt-5.4",
-        "gpt-4o-mini": "gpt-4o-mini"
       }
     }
   },
-  "model_groups": {
-    "gpt-5.4": [
-      "primary-openai",
-      "backup-openai"
-    ],
-    "gpt-4o-mini": [
-      "primary-openai",
-      "backup-openai"
-    ]
-  }
+  "order": [
+    "primary-openai",
+    "backup-openai"
+  ]
 }
