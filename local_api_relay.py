@@ -977,6 +977,97 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         return len(body)
 
 
+class RelayListener:
+    def __init__(self, config: RelayConfig, runtime_manager: RelayRuntimeManager) -> None:
+        self.server = RelayHTTPServer((config.listen_host, config.listen_port), RelayRequestHandler, runtime_manager)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+
+class RelayService:
+    def __init__(self, config_path: str | Path, reload_poll_interval_seconds: float = 1.0) -> None:
+        self.config_path = Path(config_path)
+        self.reload_poll_interval_seconds = reload_poll_interval_seconds
+        config = RelayConfig.load(self.config_path)
+        config_bytes = self.config_path.read_bytes()
+        usage_store = UsageStore(config.database_path)
+        active_runtime = RelayRuntime(
+            config=config,
+            usage_store=usage_store,
+            config_version=_hash_config_bytes(config_bytes),
+            close_usage_store_when_drained=False,
+        )
+        self.runtime_manager = RelayRuntimeManager(
+            config_path=self.config_path,
+            active_runtime=active_runtime,
+            reload_poll_interval_seconds=reload_poll_interval_seconds,
+        )
+        self.listener = RelayListener(config, self.runtime_manager)
+        self._stop_event = threading.Event()
+        self._watcher_thread = threading.Thread(target=self._watch_config_loop, daemon=True)
+        self._active_signature = (self.config_path.stat().st_mtime_ns, active_runtime.config_version)
+        self._pending_signature: tuple[int, str] | None = None
+
+    def serve_forever(self) -> None:
+        self.listener.start()
+        self._watcher_thread.start()
+        try:
+            while not self._stop_event.wait(0.1):
+                pass
+        finally:
+            self.listener.stop()
+            self.runtime_manager.active_runtime().usage_store.close()
+
+    def shutdown(self) -> None:
+        self._stop_event.set()
+        if self._watcher_thread.is_alive():
+            self._watcher_thread.join(timeout=2)
+
+    def _watch_config_loop(self) -> None:
+        while not self._stop_event.wait(self.reload_poll_interval_seconds):
+            self._maybe_reload()
+
+    def _maybe_reload(self) -> None:
+        try:
+            raw_bytes = self.config_path.read_bytes()
+            signature = (self.config_path.stat().st_mtime_ns, _hash_config_bytes(raw_bytes))
+            if signature == self._active_signature:
+                self._pending_signature = None
+                return
+            if signature != self._pending_signature:
+                self._pending_signature = signature
+                return
+            self._pending_signature = None
+            new_config = RelayConfig.load(self.config_path)
+            current_runtime = self.runtime_manager.active_runtime()
+            current_config = current_runtime.config
+            if (
+                new_config.listen_host == current_config.listen_host
+                and new_config.listen_port == current_config.listen_port
+                and Path(new_config.database_path) == Path(current_config.database_path)
+            ):
+                self.runtime_manager.swap_runtime(
+                    RelayRuntime(
+                        config=new_config,
+                        usage_store=current_runtime.usage_store,
+                        config_version=signature[1],
+                        close_usage_store_when_drained=False,
+                    )
+                )
+                self._active_signature = signature
+                return
+            raise RuntimeError("runtime-only reload path received infrastructure change")
+        except Exception as exc:
+            self.runtime_manager.record_reload_error(str(exc))
+
+
 def plan_request_attempts(config: RelayConfig, headers: Any, request_body: bytes) -> RequestPlan:
     local_key = _extract_local_key(headers)
     client = config.local_clients_by_key.get(local_key or "")
@@ -1435,27 +1526,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = RelayConfig.load(args.config)
-    usage_store = UsageStore(config.database_path)
-    runtime = RelayRuntime(
-        config=config,
-        usage_store=usage_store,
-        config_version=_hash_config_bytes(Path(args.config).read_bytes()),
-        close_usage_store_when_drained=False,
-    )
-    runtime_manager = RelayRuntimeManager(
-        config_path=Path(args.config),
-        active_runtime=runtime,
-        reload_poll_interval_seconds=1.0,
-    )
-    server = RelayHTTPServer((config.listen_host, config.listen_port), RelayRequestHandler, runtime_manager)
+    service = RelayService(args.config)
     try:
-        server.serve_forever()
+        service.serve_forever()
     except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        usage_store.close()
+        service.shutdown()
 
 
 if __name__ == "__main__":
