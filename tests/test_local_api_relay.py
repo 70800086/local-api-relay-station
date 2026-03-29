@@ -184,12 +184,22 @@ class RelayServer:
     def __init__(self, config_path: Path) -> None:
         self.config = relay.RelayConfig.load(config_path)
         self.usage_store = relay.UsageStore(self.config.database_path)
+        runtime = relay.RelayRuntime(
+            config=self.config,
+            usage_store=self.usage_store,
+            config_version=relay._hash_config_bytes(config_path.read_bytes()),
+            close_usage_store_when_drained=False,
+        )
+        self.runtime_manager = relay.RelayRuntimeManager(
+            config_path=config_path,
+            active_runtime=runtime,
+            reload_poll_interval_seconds=1.0,
+        )
         try:
             self.server = relay.RelayHTTPServer(
                 (self.config.listen_host, self.config.listen_port),
                 relay.RelayRequestHandler,
-                self.config,
-                self.usage_store,
+                self.runtime_manager,
             )
         except PermissionError as exc:
             self.usage_store.close()
@@ -465,6 +475,32 @@ class RelayStoreTests(unittest.TestCase):
         model_stats = {item["model"]: item for item in stats["models"]}
         self.assertEqual(model_stats["gpt-test"]["requests"], 2)
         self.assertNotIn("upstream_models", model_stats["gpt-test"])
+
+
+class RelayServerTests(unittest.TestCase):
+    def test_health_endpoint_reports_reload_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "relay-config.json"
+            payload = make_config_payload(
+                listen_port=find_free_port(),
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            with RelayServer(config_path):
+                status, _, payload_bytes = make_request(
+                    payload["server"]["listen_port"],
+                    "GET",
+                    "/_relay/health",
+                    headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                )
+
+        self.assertEqual(status, 200)
+        health = json.loads(payload_bytes)
+        self.assertEqual(health["reload"]["last_reload_status"], "never")
+        self.assertTrue(health["reload"]["reload_enabled"])
+        self.assertEqual(health["reload"]["config_path"], str(config_path))
+        self.assertEqual(health["reload"]["draining_runtimes"], 0)
 
 
 class LocalApiRelayIntegrationTests(unittest.TestCase):

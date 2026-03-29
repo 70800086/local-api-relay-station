@@ -578,12 +578,10 @@ class RelayHTTPServer(ThreadingHTTPServer):
         self,
         server_address: tuple[str, int],
         handler_class: type[BaseHTTPRequestHandler],
-        config: RelayConfig,
-        usage_store: UsageStore,
+        runtime_manager: RelayRuntimeManager,
     ) -> None:
         super().__init__(server_address, handler_class)
-        self.relay_config = config
-        self.usage_store = usage_store
+        self.runtime_manager = runtime_manager
 
 
 class RelayRequestHandler(BaseHTTPRequestHandler):
@@ -614,21 +612,21 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         return
 
     @property
-    def relay_config(self) -> RelayConfig:
-        return self.server.relay_config  # type: ignore[attr-defined]
-
-    @property
-    def usage_store(self) -> UsageStore:
-        return self.server.usage_store  # type: ignore[attr-defined]
+    def runtime_manager(self) -> RelayRuntimeManager:
+        return self.server.runtime_manager  # type: ignore[attr-defined]
 
     def _handle(self) -> None:
-        if self.path.startswith("/_relay/"):
-            self._handle_admin()
-            return
-        self._handle_proxy()
+        runtime = self.runtime_manager.acquire_runtime()
+        try:
+            if self.path.startswith("/_relay/"):
+                self._handle_admin(runtime)
+                return
+            self._handle_proxy(runtime)
+        finally:
+            runtime.close()
 
-    def _handle_admin(self) -> None:
-        if self.relay_config.admin_key and self.headers.get("X-Relay-Admin-Key", "") != self.relay_config.admin_key:
+    def _handle_admin(self, runtime: RuntimeLease) -> None:
+        if runtime.config.admin_key and self.headers.get("X-Relay-Admin-Key", "") != runtime.config.admin_key:
             self._send_json(403, {"error": {"message": "forbidden"}})
             return
         if self.path == "/_relay/health":
@@ -637,14 +635,14 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "server": {
-                        "listen_host": self.relay_config.listen_host,
-                        "listen_port": self.relay_config.listen_port,
-                        "database_path": str(self.relay_config.database_path),
-                        "idle_window_seconds": self.relay_config.idle_window_seconds,
-                        "request_timeout_seconds": self.relay_config.request_timeout_seconds,
+                        "listen_host": runtime.config.listen_host,
+                        "listen_port": runtime.config.listen_port,
+                        "database_path": str(runtime.config.database_path),
+                        "idle_window_seconds": runtime.config.idle_window_seconds,
+                        "request_timeout_seconds": runtime.config.request_timeout_seconds,
                     },
                     "local": {
-                        "clients": sorted(client.client_id for client in self.relay_config.local_clients),
+                        "clients": sorted(client.client_id for client in runtime.config.local_clients),
                     },
                     "upstreams": [
                         {
@@ -653,26 +651,27 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             "enabled": upstream.enabled,
                             "transport": upstream.transport,
                         }
-                        for upstream in sorted(self.relay_config.upstreams, key=lambda item: item.upstream_id)
+                        for upstream in sorted(runtime.config.upstreams, key=lambda item: item.upstream_id)
                     ],
-                    "order": list(self.relay_config.order),
+                    "order": list(runtime.config.order),
+                    "reload": self.runtime_manager.reload_state_snapshot(),
                 },
             )
             return
         if self.path == "/_relay/stats":
-            self._send_json(200, self.usage_store.stats_summary())
+            self._send_json(200, runtime.usage_store.stats_summary())
             return
         if self.path == "/_relay/idle":
-            self._send_json(200, self.usage_store.idle_status(self.relay_config.idle_window_seconds))
+            self._send_json(200, runtime.usage_store.idle_status(runtime.config.idle_window_seconds))
             return
         self._send_json(404, {"error": {"message": "admin endpoint not found"}})
 
-    def _handle_proxy(self) -> None:
+    def _handle_proxy(self, runtime: RuntimeLease) -> None:
         original_request_body = self._read_request_body()
-        plan = plan_request_attempts(self.relay_config, self.headers, original_request_body)
+        plan = plan_request_attempts(runtime.config, self.headers, original_request_body)
         client_id = plan.client.client_id if plan.client is not None else None
         initial_upstream_id = plan.attempts[0].upstream.upstream_id if plan.attempts else None
-        self.usage_store.request_started(client_id, initial_upstream_id, plan.requested_model)
+        runtime.usage_store.request_started(client_id, initial_upstream_id, plan.requested_model)
         try:
             if plan.error_status is not None:
                 started_at = datetime.now(timezone.utc)
@@ -681,7 +680,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     {"error": {"message": plan.error_message or "relay request rejected"}},
                 )
                 finished_at = datetime.now(timezone.utc)
-                self.usage_store.record_request(
+                runtime.usage_store.record_request(
                     started_at=started_at,
                     finished_at=finished_at,
                     client_id=client_id,
@@ -716,7 +715,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     connection = connection_class(
                         parsed_target.hostname,
                         parsed_target.port,
-                        timeout=attempt.upstream.timeout_seconds(self.relay_config.request_timeout_seconds),
+                        timeout=attempt.upstream.timeout_seconds(runtime.config.request_timeout_seconds),
                     )
                     forwarded_headers = _build_upstream_headers(self.headers, attempt.upstream.api_key)
                     connection.request(
@@ -729,7 +728,11 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
 
                     if response.status < 400 or _is_upgrade_response(self.headers, response):
                         if _is_upgrade_response(self.headers, response):
-                            response_bytes = self._relay_upstream_upgrade(connection, response)
+                            response_bytes = self._relay_upstream_upgrade(
+                                connection,
+                                response,
+                                runtime.config.request_timeout_seconds,
+                            )
                             captured_body = b""
                         else:
                             response_bytes, captured_body = self._relay_upstream_response(response)
@@ -738,7 +741,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             response.getheader("Content-Type", ""),
                             captured_body,
                         )
-                        self.usage_store.record_request(
+                        runtime.usage_store.record_request(
                             started_at=attempt_started_at,
                             finished_at=finished_at,
                             client_id=client_id,
@@ -772,7 +775,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         plan.requested_model,
                     )
                     can_retry = should_retry and index + 1 < len(plan.attempts)
-                    self.usage_store.record_request(
+                    runtime.usage_store.record_request(
                         started_at=attempt_started_at,
                         finished_at=finished_at,
                         client_id=client_id,
@@ -807,7 +810,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     return
                 except (OSError, TimeoutError, http.client.HTTPException):
                     finished_at = datetime.now(timezone.utc)
-                    self.usage_store.record_request(
+                    runtime.usage_store.record_request(
                         started_at=attempt_started_at,
                         finished_at=finished_at,
                         client_id=client_id,
@@ -851,7 +854,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(502, {"error": {"message": "upstream request failed"}})
         finally:
-            self.usage_store.request_finished(client_id, initial_upstream_id, plan.requested_model)
+            runtime.usage_store.request_finished(client_id, initial_upstream_id, plan.requested_model)
 
     def _relay_upstream_response(self, response: http.client.HTTPResponse) -> tuple[int, bytes]:
         upstream_headers = response.getheaders()
@@ -897,6 +900,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         self,
         connection: http.client.HTTPConnection | http.client.HTTPSConnection,
         response: http.client.HTTPResponse,
+        request_timeout_seconds: int,
     ) -> int:
         upstream_headers = response.getheaders()
         self.send_response(response.status, response.reason)
@@ -917,7 +921,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 sockets,
                 [],
                 sockets,
-                self.relay_config.request_timeout_seconds,
+                request_timeout_seconds,
             )
             if exceptional or not readable:
                 break
@@ -1433,7 +1437,18 @@ def main() -> None:
     args = parse_args()
     config = RelayConfig.load(args.config)
     usage_store = UsageStore(config.database_path)
-    server = RelayHTTPServer((config.listen_host, config.listen_port), RelayRequestHandler, config, usage_store)
+    runtime = RelayRuntime(
+        config=config,
+        usage_store=usage_store,
+        config_version=_hash_config_bytes(Path(args.config).read_bytes()),
+        close_usage_store_when_drained=False,
+    )
+    runtime_manager = RelayRuntimeManager(
+        config_path=Path(args.config),
+        active_runtime=runtime,
+        reload_poll_interval_seconds=1.0,
+    )
+    server = RelayHTTPServer((config.listen_host, config.listen_port), RelayRequestHandler, runtime_manager)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
