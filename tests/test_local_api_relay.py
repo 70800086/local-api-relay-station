@@ -702,6 +702,76 @@ class RelayHotReloadTests(unittest.TestCase):
         self.assertEqual(first_count, 1)
         self.assertEqual(second_count, 1)
 
+    def test_listener_reload_moves_service_to_new_port(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            first_port = find_free_port()
+            second_port = find_free_port()
+            config_path = Path(tmp_dir) / "relay-config.json"
+            payload = make_config_payload(
+                listen_port=first_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            self.write_config(config_path, payload)
+
+            with RelayServiceHarness(config_path):
+                payload["server"]["listen_port"] = second_port
+                self.write_config(config_path, payload)
+
+                def moved() -> bool:
+                    try:
+                        status, _, response = make_request(
+                            second_port,
+                            "GET",
+                            "/_relay/health",
+                            headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                        )
+                    except OSError:
+                        return False
+                    health = json.loads(response)
+                    return status == 200 and health["server"]["listen_port"] == second_port
+
+                wait_for(moved)
+                with self.assertRaises(OSError):
+                    make_request(
+                        first_port,
+                        "GET",
+                        "/_relay/health",
+                        headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                    )
+
+    def test_listener_reload_bind_failure_keeps_previous_port_alive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            first_port = find_free_port()
+            blocked_port = find_free_port()
+            config_path = Path(tmp_dir) / "relay-config.json"
+            payload = make_config_payload(
+                listen_port=first_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            self.write_config(config_path, payload)
+
+            blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            blocker.bind(("127.0.0.1", blocked_port))
+            blocker.listen(1)
+            try:
+                with RelayServiceHarness(config_path):
+                    payload["server"]["listen_port"] = blocked_port
+                    self.write_config(config_path, payload)
+
+                    def failed() -> bool:
+                        status, _, response = make_request(
+                            first_port,
+                            "GET",
+                            "/_relay/health",
+                            headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                        )
+                        health = json.loads(response)
+                        return status == 200 and health["reload"]["last_reload_status"] == "error"
+
+                    wait_for(failed)
+            finally:
+                blocker.close()
+
 
 class LocalApiRelayIntegrationTests(unittest.TestCase):
     def write_config(self, tmp_dir: str, payload: dict[str, Any]) -> Path:

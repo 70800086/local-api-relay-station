@@ -1052,6 +1052,40 @@ class RelayService:
         )
         self.runtime_manager.swap_runtime(new_runtime, close_retired_usage_store=True)
 
+    def _reload_listener_runtime(self, new_config: RelayConfig, config_version: str) -> None:
+        current_listener = self.listener
+        current_runtime = self.runtime_manager.active_runtime()
+        new_store = (
+            UsageStore(new_config.database_path)
+            if Path(new_config.database_path) != Path(current_runtime.config.database_path)
+            else current_runtime.usage_store
+        )
+        close_retired_usage_store = new_store is not current_runtime.usage_store
+        new_runtime = RelayRuntime(
+            config=new_config,
+            usage_store=new_store,
+            config_version=config_version,
+            close_usage_store_when_drained=close_retired_usage_store,
+        )
+        try:
+            new_listener = RelayListener(new_config, self.runtime_manager)
+        except Exception:
+            if close_retired_usage_store:
+                new_store.close()
+            raise
+        try:
+            new_listener.start()
+        except Exception:
+            if close_retired_usage_store:
+                new_store.close()
+            raise
+        self.listener = new_listener
+        self.runtime_manager.swap_runtime(
+            new_runtime,
+            close_retired_usage_store=close_retired_usage_store,
+        )
+        current_listener.stop()
+
     def _maybe_reload(self) -> None:
         try:
             raw_bytes = self.config_path.read_bytes()
@@ -1066,6 +1100,13 @@ class RelayService:
             new_config = RelayConfig.load(self.config_path)
             current_runtime = self.runtime_manager.active_runtime()
             current_config = current_runtime.config
+            if (
+                new_config.listen_host != current_config.listen_host
+                or new_config.listen_port != current_config.listen_port
+            ):
+                self._reload_listener_runtime(new_config, signature[1])
+                self._active_signature = signature
+                return
             if Path(new_config.database_path) != Path(current_config.database_path):
                 self._reload_database_runtime(new_config, signature[1])
                 self._active_signature = signature
