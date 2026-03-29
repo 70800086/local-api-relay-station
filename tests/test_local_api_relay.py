@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import http.client
 import json
+import sqlite3
 import socket
 import tempfile
 import threading
@@ -59,6 +60,15 @@ def make_request(
     response_headers = {key.lower(): value for key, value in response.getheaders()}
     connection.close()
     return response.status, response_headers, payload
+
+
+def wait_for(predicate: Any, timeout: float = 2.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(0.05)
+    raise AssertionError("condition was not met before timeout")
 
 
 def make_config_payload(
@@ -184,12 +194,22 @@ class RelayServer:
     def __init__(self, config_path: Path) -> None:
         self.config = relay.RelayConfig.load(config_path)
         self.usage_store = relay.UsageStore(self.config.database_path)
+        runtime = relay.RelayRuntime(
+            config=self.config,
+            usage_store=self.usage_store,
+            config_version=relay._hash_config_bytes(config_path.read_bytes()),
+            close_usage_store_when_drained=False,
+        )
+        self.runtime_manager = relay.RelayRuntimeManager(
+            config_path=config_path,
+            active_runtime=runtime,
+            reload_poll_interval_seconds=1.0,
+        )
         try:
             self.server = relay.RelayHTTPServer(
                 (self.config.listen_host, self.config.listen_port),
                 relay.RelayRequestHandler,
-                self.config,
-                self.usage_store,
+                self.runtime_manager,
             )
         except PermissionError as exc:
             self.usage_store.close()
@@ -217,6 +237,71 @@ class RelayServer:
         self.server.server_close()
         self.thread.join(timeout=2)
         self.usage_store.close()
+
+
+class RelayServiceHarness:
+    def __init__(self, config_path: Path, reload_poll_interval_seconds: float = 0.05) -> None:
+        self.service = relay.RelayService(config_path, reload_poll_interval_seconds=reload_poll_interval_seconds)
+        self.config = relay.RelayConfig.load(config_path)
+        self.port = self.config.listen_port
+        self.admin_key = self.config.admin_key
+        self.thread = threading.Thread(target=self.service.serve_forever, daemon=True)
+
+    def __enter__(self) -> "RelayServiceHarness":
+        self.thread.start()
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            try:
+                make_request(
+                    self.port,
+                    "GET",
+                    "/_relay/health",
+                    headers={"X-Relay-Admin-Key": self.admin_key},
+                )
+                return self
+            except OSError:
+                time.sleep(0.05)
+        raise AssertionError("relay service did not become ready in time")
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.service.shutdown()
+        self.thread.join(timeout=2)
+
+
+class RelayRuntimeManagerTests(unittest.TestCase):
+    def test_runtime_manager_tracks_runtime_lease_and_reload_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "relay-config.json"
+            payload = make_config_payload(
+                listen_port=find_free_port(),
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            config = relay.RelayConfig.load(config_path)
+            store = relay.UsageStore(Path(tmp_dir) / "relay.sqlite3")
+            try:
+                runtime = relay.RelayRuntime(
+                    config=config,
+                    usage_store=store,
+                    config_version=relay._hash_config_bytes(config_path.read_bytes()),
+                    close_usage_store_when_drained=False,
+                )
+                manager = relay.RelayRuntimeManager(
+                    config_path=config_path,
+                    active_runtime=runtime,
+                    reload_poll_interval_seconds=1.0,
+                )
+
+                lease = manager.acquire_runtime()
+                self.assertEqual(lease.config.order, ["primary", "backup"])
+                self.assertEqual(runtime.active_requests, 1)
+                self.assertEqual(manager.reload_state_snapshot()["last_reload_status"], "never")
+                self.assertEqual(manager.reload_state_snapshot()["draining_runtimes"], 0)
+                lease.close()
+                self.assertEqual(runtime.active_requests, 0)
+            finally:
+                store.close()
 
 
 class RelayPlanningTests(unittest.TestCase):
@@ -429,6 +514,263 @@ class RelayStoreTests(unittest.TestCase):
         model_stats = {item["model"]: item for item in stats["models"]}
         self.assertEqual(model_stats["gpt-test"]["requests"], 2)
         self.assertNotIn("upstream_models", model_stats["gpt-test"])
+
+
+class RelayServerTests(unittest.TestCase):
+    def test_health_endpoint_reports_reload_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "relay-config.json"
+            payload = make_config_payload(
+                listen_port=find_free_port(),
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            with RelayServer(config_path):
+                status, _, payload_bytes = make_request(
+                    payload["server"]["listen_port"],
+                    "GET",
+                    "/_relay/health",
+                    headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                )
+
+        self.assertEqual(status, 200)
+        health = json.loads(payload_bytes)
+        self.assertEqual(health["reload"]["last_reload_status"], "never")
+        self.assertTrue(health["reload"]["reload_enabled"])
+        self.assertEqual(health["reload"]["config_path"], str(config_path))
+        self.assertEqual(health["reload"]["draining_runtimes"], 0)
+
+
+class RelayHotReloadTests(unittest.TestCase):
+    def write_config(self, path: Path, payload: dict[str, Any]) -> None:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def test_runtime_only_reload_updates_order_and_local_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            primary_upstream = UpstreamServer()
+            backup_upstream = UpstreamServer()
+            with primary_upstream, backup_upstream:
+                port = find_free_port()
+                config_path = Path(tmp_dir) / "relay-config.json"
+                payload = make_config_payload(
+                    listen_port=port,
+                    database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                    upstream_base_urls={
+                        "primary": f"http://127.0.0.1:{primary_upstream.port}/v1",
+                        "backup": f"http://127.0.0.1:{backup_upstream.port}/v1",
+                    },
+                )
+                self.write_config(config_path, payload)
+
+                with RelayServiceHarness(config_path):
+                    RecordingUpstreamHandler.queue_responses({"status": 201})
+                    status, _, _ = make_request(
+                        port,
+                        "POST",
+                        "/v1/chat/completions",
+                        headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
+                        body=b'{"model":"gpt-test","messages":[]}',
+                    )
+                    self.assertEqual(status, 201)
+                    self.assertEqual(
+                        RecordingUpstreamHandler.requests[0]["headers"]["authorization"],
+                        "Bearer upstream-primary-key",
+                    )
+
+                    payload["order"] = ["backup", "primary"]
+                    payload["local"]["clients"].append({"client_id": "new-client", "local_key": "local-new-key"})
+                    self.write_config(config_path, payload)
+
+                    def reloaded() -> bool:
+                        health_status, _, health_payload = make_request(
+                            port,
+                            "GET",
+                            "/_relay/health",
+                            headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                        )
+                        health = json.loads(health_payload)
+                        return health_status == 200 and health["order"] == ["backup", "primary"]
+
+                    wait_for(reloaded)
+
+                    RecordingUpstreamHandler.requests.clear()
+                    RecordingUpstreamHandler.queue_responses({"status": 201})
+                    status, _, _ = make_request(
+                        port,
+                        "POST",
+                        "/v1/chat/completions",
+                        headers={"Authorization": "Bearer local-new-key", "Content-Type": "application/json"},
+                        body=b'{"model":"gpt-test","messages":[]}',
+                    )
+                    self.assertEqual(status, 201)
+                    self.assertEqual(
+                        RecordingUpstreamHandler.requests[0]["headers"]["authorization"],
+                        "Bearer upstream-backup-key",
+                    )
+
+    def test_invalid_reload_keeps_old_runtime_and_reports_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            port = find_free_port()
+            config_path = Path(tmp_dir) / "relay-config.json"
+            payload = make_config_payload(
+                listen_port=port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            self.write_config(config_path, payload)
+
+            with RelayServiceHarness(config_path):
+                config_path.write_text("{bad json", encoding="utf-8")
+
+                def reload_failed() -> bool:
+                    status, _, response = make_request(
+                        port,
+                        "GET",
+                        "/_relay/health",
+                        headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                    )
+                    health = json.loads(response)
+                    return status == 200 and health["reload"]["last_reload_status"] == "error"
+
+                wait_for(reload_failed)
+
+                status, _, _ = make_request(
+                    port,
+                    "GET",
+                    "/_relay/health",
+                    headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                )
+                self.assertEqual(status, 200)
+
+    def test_database_path_reload_switches_new_requests_to_new_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with UpstreamServer() as upstream:
+                port = find_free_port()
+                first_db = Path(tmp_dir) / "relay.sqlite3"
+                second_db = Path(tmp_dir) / "relay-next.sqlite3"
+                config_path = Path(tmp_dir) / "relay-config.json"
+                payload = make_config_payload(
+                    listen_port=port,
+                    database_path=str(first_db),
+                    upstream_base_urls={
+                        "primary": f"http://127.0.0.1:{upstream.port}/v1",
+                        "backup": f"http://127.0.0.1:{upstream.port}/v1",
+                    },
+                )
+                self.write_config(config_path, payload)
+
+                with RelayServiceHarness(config_path):
+                    RecordingUpstreamHandler.queue_responses({"status": 201}, {"status": 201})
+                    first_status, _, _ = make_request(
+                        port,
+                        "POST",
+                        "/v1/chat/completions",
+                        headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
+                        body=b'{"model":"gpt-test","messages":[]}',
+                    )
+                    self.assertEqual(first_status, 201)
+
+                    payload["server"]["database_path"] = str(second_db)
+                    self.write_config(config_path, payload)
+
+                    def switched() -> bool:
+                        status, _, response = make_request(
+                            port,
+                            "GET",
+                            "/_relay/health",
+                            headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                        )
+                        health = json.loads(response)
+                        return status == 200 and health["server"]["database_path"] == str(second_db)
+
+                    wait_for(switched)
+
+                    second_status, _, _ = make_request(
+                        port,
+                        "POST",
+                        "/v1/chat/completions",
+                        headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
+                        body=b'{"model":"gpt-test","messages":[]}',
+                    )
+                    self.assertEqual(second_status, 201)
+
+            with sqlite3.connect(first_db) as first_conn:
+                first_count = first_conn.execute(f"SELECT COUNT(*) FROM {relay.REQUEST_LOG_TABLE}").fetchone()[0]
+            with sqlite3.connect(second_db) as second_conn:
+                second_count = second_conn.execute(f"SELECT COUNT(*) FROM {relay.REQUEST_LOG_TABLE}").fetchone()[0]
+
+        self.assertEqual(first_count, 1)
+        self.assertEqual(second_count, 1)
+
+    def test_listener_reload_moves_service_to_new_port(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            first_port = find_free_port()
+            second_port = find_free_port()
+            config_path = Path(tmp_dir) / "relay-config.json"
+            payload = make_config_payload(
+                listen_port=first_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            self.write_config(config_path, payload)
+
+            with RelayServiceHarness(config_path):
+                payload["server"]["listen_port"] = second_port
+                self.write_config(config_path, payload)
+
+                def moved() -> bool:
+                    try:
+                        status, _, response = make_request(
+                            second_port,
+                            "GET",
+                            "/_relay/health",
+                            headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                        )
+                    except OSError:
+                        return False
+                    health = json.loads(response)
+                    return status == 200 and health["server"]["listen_port"] == second_port
+
+                wait_for(moved)
+                with self.assertRaises(OSError):
+                    make_request(
+                        first_port,
+                        "GET",
+                        "/_relay/health",
+                        headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                    )
+
+    def test_listener_reload_bind_failure_keeps_previous_port_alive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            first_port = find_free_port()
+            blocked_port = find_free_port()
+            config_path = Path(tmp_dir) / "relay-config.json"
+            payload = make_config_payload(
+                listen_port=first_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            self.write_config(config_path, payload)
+
+            blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            blocker.bind(("127.0.0.1", blocked_port))
+            blocker.listen(1)
+            try:
+                with RelayServiceHarness(config_path):
+                    payload["server"]["listen_port"] = blocked_port
+                    self.write_config(config_path, payload)
+
+                    def failed() -> bool:
+                        status, _, response = make_request(
+                            first_port,
+                            "GET",
+                            "/_relay/health",
+                            headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                        )
+                        health = json.loads(response)
+                        return status == 200 and health["reload"]["last_reload_status"] == "error"
+
+                    wait_for(failed)
+            finally:
+                blocker.close()
 
 
 class LocalApiRelayIntegrationTests(unittest.TestCase):

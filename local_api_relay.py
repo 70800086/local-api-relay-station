@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import select
@@ -448,17 +449,147 @@ class UsageStore:
         }
 
 
+@dataclass
+class RelayRuntime:
+    config: RelayConfig
+    usage_store: UsageStore
+    config_version: str
+    close_usage_store_when_drained: bool
+    active_requests: int = 0
+
+
+@dataclass
+class ReloadState:
+    config_path: Path
+    config_version: str
+    reload_enabled: bool
+    reload_poll_interval_seconds: float
+    last_reload_at: str | None = None
+    last_reload_status: str = "never"
+    last_reload_error: str | None = None
+    last_successful_reload_at: str | None = None
+
+    def as_dict(self, *, draining_runtimes: int) -> dict[str, Any]:
+        return {
+            "config_path": str(self.config_path),
+            "config_version": self.config_version,
+            "reload_enabled": self.reload_enabled,
+            "reload_poll_interval_seconds": self.reload_poll_interval_seconds,
+            "last_reload_at": self.last_reload_at,
+            "last_reload_status": self.last_reload_status,
+            "last_reload_error": self.last_reload_error,
+            "last_successful_reload_at": self.last_successful_reload_at,
+            "draining_runtimes": draining_runtimes,
+        }
+
+
+class RuntimeLease:
+    def __init__(self, manager: "RelayRuntimeManager", runtime: RelayRuntime) -> None:
+        self._manager = manager
+        self._runtime = runtime
+        self._closed = False
+
+    @property
+    def config(self) -> RelayConfig:
+        return self._runtime.config
+
+    @property
+    def usage_store(self) -> UsageStore:
+        return self._runtime.usage_store
+
+    @property
+    def config_version(self) -> str:
+        return self._runtime.config_version
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._manager.release_runtime(self._runtime)
+
+
+class RelayRuntimeManager:
+    def __init__(
+        self,
+        *,
+        config_path: Path,
+        active_runtime: RelayRuntime,
+        reload_poll_interval_seconds: float,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._active_runtime = active_runtime
+        self._draining_runtimes: list[RelayRuntime] = []
+        self._reload_state = ReloadState(
+            config_path=config_path,
+            config_version=active_runtime.config_version,
+            reload_enabled=True,
+            reload_poll_interval_seconds=reload_poll_interval_seconds,
+        )
+
+    def acquire_runtime(self) -> RuntimeLease:
+        with self._lock:
+            self._active_runtime.active_requests += 1
+            return RuntimeLease(self, self._active_runtime)
+
+    def release_runtime(self, runtime: RelayRuntime) -> None:
+        stores_to_close: list[UsageStore] = []
+        with self._lock:
+            runtime.active_requests = max(0, runtime.active_requests - 1)
+            survivors: list[RelayRuntime] = []
+            for retired in self._draining_runtimes:
+                if retired.active_requests == 0:
+                    if retired.close_usage_store_when_drained:
+                        stores_to_close.append(retired.usage_store)
+                    continue
+                survivors.append(retired)
+            self._draining_runtimes = survivors
+        for store in stores_to_close:
+            store.close()
+
+    def reload_state_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return self._reload_state.as_dict(draining_runtimes=len(self._draining_runtimes))
+
+    def active_runtime(self) -> RelayRuntime:
+        with self._lock:
+            return self._active_runtime
+
+    def swap_runtime(self, runtime: RelayRuntime, *, close_retired_usage_store: bool = False) -> None:
+        stores_to_close: list[UsageStore] = []
+        with self._lock:
+            retired = self._active_runtime
+            retired.close_usage_store_when_drained = retired.close_usage_store_when_drained or close_retired_usage_store
+            self._active_runtime = runtime
+            self._reload_state.config_version = runtime.config_version
+            self._reload_state.last_reload_at = datetime.now(timezone.utc).isoformat()
+            self._reload_state.last_reload_status = "success"
+            self._reload_state.last_reload_error = None
+            self._reload_state.last_successful_reload_at = self._reload_state.last_reload_at
+            if retired is not runtime:
+                if retired.active_requests == 0:
+                    if retired.close_usage_store_when_drained:
+                        stores_to_close.append(retired.usage_store)
+                else:
+                    self._draining_runtimes.append(retired)
+        for store in stores_to_close:
+            store.close()
+
+    def record_reload_error(self, message: str) -> None:
+        with self._lock:
+            self._reload_state.last_reload_at = datetime.now(timezone.utc).isoformat()
+            self._reload_state.last_reload_status = "error"
+            self._reload_state.last_reload_error = message
+
+
 class RelayHTTPServer(ThreadingHTTPServer):
     def __init__(
         self,
         server_address: tuple[str, int],
         handler_class: type[BaseHTTPRequestHandler],
-        config: RelayConfig,
-        usage_store: UsageStore,
+        runtime_manager: RelayRuntimeManager,
     ) -> None:
         super().__init__(server_address, handler_class)
-        self.relay_config = config
-        self.usage_store = usage_store
+        self.runtime_manager = runtime_manager
 
 
 class RelayRequestHandler(BaseHTTPRequestHandler):
@@ -489,21 +620,21 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         return
 
     @property
-    def relay_config(self) -> RelayConfig:
-        return self.server.relay_config  # type: ignore[attr-defined]
-
-    @property
-    def usage_store(self) -> UsageStore:
-        return self.server.usage_store  # type: ignore[attr-defined]
+    def runtime_manager(self) -> RelayRuntimeManager:
+        return self.server.runtime_manager  # type: ignore[attr-defined]
 
     def _handle(self) -> None:
-        if self.path.startswith("/_relay/"):
-            self._handle_admin()
-            return
-        self._handle_proxy()
+        runtime = self.runtime_manager.acquire_runtime()
+        try:
+            if self.path.startswith("/_relay/"):
+                self._handle_admin(runtime)
+                return
+            self._handle_proxy(runtime)
+        finally:
+            runtime.close()
 
-    def _handle_admin(self) -> None:
-        if self.relay_config.admin_key and self.headers.get("X-Relay-Admin-Key", "") != self.relay_config.admin_key:
+    def _handle_admin(self, runtime: RuntimeLease) -> None:
+        if runtime.config.admin_key and self.headers.get("X-Relay-Admin-Key", "") != runtime.config.admin_key:
             self._send_json(403, {"error": {"message": "forbidden"}})
             return
         if self.path == "/_relay/health":
@@ -512,14 +643,14 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "server": {
-                        "listen_host": self.relay_config.listen_host,
-                        "listen_port": self.relay_config.listen_port,
-                        "database_path": str(self.relay_config.database_path),
-                        "idle_window_seconds": self.relay_config.idle_window_seconds,
-                        "request_timeout_seconds": self.relay_config.request_timeout_seconds,
+                        "listen_host": runtime.config.listen_host,
+                        "listen_port": runtime.config.listen_port,
+                        "database_path": str(runtime.config.database_path),
+                        "idle_window_seconds": runtime.config.idle_window_seconds,
+                        "request_timeout_seconds": runtime.config.request_timeout_seconds,
                     },
                     "local": {
-                        "clients": sorted(client.client_id for client in self.relay_config.local_clients),
+                        "clients": sorted(client.client_id for client in runtime.config.local_clients),
                     },
                     "upstreams": [
                         {
@@ -528,26 +659,27 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             "enabled": upstream.enabled,
                             "transport": upstream.transport,
                         }
-                        for upstream in sorted(self.relay_config.upstreams, key=lambda item: item.upstream_id)
+                        for upstream in sorted(runtime.config.upstreams, key=lambda item: item.upstream_id)
                     ],
-                    "order": list(self.relay_config.order),
+                    "order": list(runtime.config.order),
+                    "reload": self.runtime_manager.reload_state_snapshot(),
                 },
             )
             return
         if self.path == "/_relay/stats":
-            self._send_json(200, self.usage_store.stats_summary())
+            self._send_json(200, runtime.usage_store.stats_summary())
             return
         if self.path == "/_relay/idle":
-            self._send_json(200, self.usage_store.idle_status(self.relay_config.idle_window_seconds))
+            self._send_json(200, runtime.usage_store.idle_status(runtime.config.idle_window_seconds))
             return
         self._send_json(404, {"error": {"message": "admin endpoint not found"}})
 
-    def _handle_proxy(self) -> None:
+    def _handle_proxy(self, runtime: RuntimeLease) -> None:
         original_request_body = self._read_request_body()
-        plan = plan_request_attempts(self.relay_config, self.headers, original_request_body)
+        plan = plan_request_attempts(runtime.config, self.headers, original_request_body)
         client_id = plan.client.client_id if plan.client is not None else None
         initial_upstream_id = plan.attempts[0].upstream.upstream_id if plan.attempts else None
-        self.usage_store.request_started(client_id, initial_upstream_id, plan.requested_model)
+        runtime.usage_store.request_started(client_id, initial_upstream_id, plan.requested_model)
         try:
             if plan.error_status is not None:
                 started_at = datetime.now(timezone.utc)
@@ -556,7 +688,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     {"error": {"message": plan.error_message or "relay request rejected"}},
                 )
                 finished_at = datetime.now(timezone.utc)
-                self.usage_store.record_request(
+                runtime.usage_store.record_request(
                     started_at=started_at,
                     finished_at=finished_at,
                     client_id=client_id,
@@ -591,7 +723,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     connection = connection_class(
                         parsed_target.hostname,
                         parsed_target.port,
-                        timeout=attempt.upstream.timeout_seconds(self.relay_config.request_timeout_seconds),
+                        timeout=attempt.upstream.timeout_seconds(runtime.config.request_timeout_seconds),
                     )
                     forwarded_headers = _build_upstream_headers(self.headers, attempt.upstream.api_key)
                     connection.request(
@@ -604,7 +736,11 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
 
                     if response.status < 400 or _is_upgrade_response(self.headers, response):
                         if _is_upgrade_response(self.headers, response):
-                            response_bytes = self._relay_upstream_upgrade(connection, response)
+                            response_bytes = self._relay_upstream_upgrade(
+                                connection,
+                                response,
+                                runtime.config.request_timeout_seconds,
+                            )
                             captured_body = b""
                         else:
                             response_bytes, captured_body = self._relay_upstream_response(response)
@@ -613,7 +749,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             response.getheader("Content-Type", ""),
                             captured_body,
                         )
-                        self.usage_store.record_request(
+                        runtime.usage_store.record_request(
                             started_at=attempt_started_at,
                             finished_at=finished_at,
                             client_id=client_id,
@@ -647,7 +783,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         plan.requested_model,
                     )
                     can_retry = should_retry and index + 1 < len(plan.attempts)
-                    self.usage_store.record_request(
+                    runtime.usage_store.record_request(
                         started_at=attempt_started_at,
                         finished_at=finished_at,
                         client_id=client_id,
@@ -682,7 +818,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     return
                 except (OSError, TimeoutError, http.client.HTTPException):
                     finished_at = datetime.now(timezone.utc)
-                    self.usage_store.record_request(
+                    runtime.usage_store.record_request(
                         started_at=attempt_started_at,
                         finished_at=finished_at,
                         client_id=client_id,
@@ -726,7 +862,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(502, {"error": {"message": "upstream request failed"}})
         finally:
-            self.usage_store.request_finished(client_id, initial_upstream_id, plan.requested_model)
+            runtime.usage_store.request_finished(client_id, initial_upstream_id, plan.requested_model)
 
     def _relay_upstream_response(self, response: http.client.HTTPResponse) -> tuple[int, bytes]:
         upstream_headers = response.getheaders()
@@ -772,6 +908,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         self,
         connection: http.client.HTTPConnection | http.client.HTTPSConnection,
         response: http.client.HTTPResponse,
+        request_timeout_seconds: int,
     ) -> int:
         upstream_headers = response.getheaders()
         self.send_response(response.status, response.reason)
@@ -792,7 +929,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 sockets,
                 [],
                 sockets,
-                self.relay_config.request_timeout_seconds,
+                request_timeout_seconds,
             )
             if exceptional or not readable:
                 break
@@ -846,6 +983,152 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             self.wfile.flush()
         return len(body)
+
+
+class RelayListener:
+    def __init__(self, config: RelayConfig, runtime_manager: RelayRuntimeManager) -> None:
+        self.server = RelayHTTPServer((config.listen_host, config.listen_port), RelayRequestHandler, runtime_manager)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+
+class RelayService:
+    def __init__(self, config_path: str | Path, reload_poll_interval_seconds: float = 1.0) -> None:
+        self.config_path = Path(config_path)
+        self.reload_poll_interval_seconds = reload_poll_interval_seconds
+        config = RelayConfig.load(self.config_path)
+        config_bytes = self.config_path.read_bytes()
+        usage_store = UsageStore(config.database_path)
+        active_runtime = RelayRuntime(
+            config=config,
+            usage_store=usage_store,
+            config_version=_hash_config_bytes(config_bytes),
+            close_usage_store_when_drained=False,
+        )
+        self.runtime_manager = RelayRuntimeManager(
+            config_path=self.config_path,
+            active_runtime=active_runtime,
+            reload_poll_interval_seconds=reload_poll_interval_seconds,
+        )
+        self.listener = RelayListener(config, self.runtime_manager)
+        self._stop_event = threading.Event()
+        self._watcher_thread = threading.Thread(target=self._watch_config_loop, daemon=True)
+        self._active_signature = (self.config_path.stat().st_mtime_ns, active_runtime.config_version)
+        self._pending_signature: tuple[int, str] | None = None
+
+    def serve_forever(self) -> None:
+        self.listener.start()
+        self._watcher_thread.start()
+        try:
+            while not self._stop_event.wait(0.1):
+                pass
+        finally:
+            self.listener.stop()
+            self.runtime_manager.active_runtime().usage_store.close()
+
+    def shutdown(self) -> None:
+        self._stop_event.set()
+        if self._watcher_thread.is_alive():
+            self._watcher_thread.join(timeout=2)
+
+    def _watch_config_loop(self) -> None:
+        while not self._stop_event.wait(self.reload_poll_interval_seconds):
+            self._maybe_reload()
+
+    def _reload_database_runtime(self, new_config: RelayConfig, config_version: str) -> None:
+        new_store = UsageStore(new_config.database_path)
+        new_runtime = RelayRuntime(
+            config=new_config,
+            usage_store=new_store,
+            config_version=config_version,
+            close_usage_store_when_drained=True,
+        )
+        self.runtime_manager.swap_runtime(new_runtime, close_retired_usage_store=True)
+
+    def _reload_listener_runtime(self, new_config: RelayConfig, config_version: str) -> None:
+        current_listener = self.listener
+        current_runtime = self.runtime_manager.active_runtime()
+        new_store = (
+            UsageStore(new_config.database_path)
+            if Path(new_config.database_path) != Path(current_runtime.config.database_path)
+            else current_runtime.usage_store
+        )
+        close_retired_usage_store = new_store is not current_runtime.usage_store
+        new_runtime = RelayRuntime(
+            config=new_config,
+            usage_store=new_store,
+            config_version=config_version,
+            close_usage_store_when_drained=close_retired_usage_store,
+        )
+        try:
+            new_listener = RelayListener(new_config, self.runtime_manager)
+        except Exception:
+            if close_retired_usage_store:
+                new_store.close()
+            raise
+        try:
+            new_listener.start()
+        except Exception:
+            if close_retired_usage_store:
+                new_store.close()
+            raise
+        self.listener = new_listener
+        self.runtime_manager.swap_runtime(
+            new_runtime,
+            close_retired_usage_store=close_retired_usage_store,
+        )
+        current_listener.stop()
+
+    def _maybe_reload(self) -> None:
+        try:
+            raw_bytes = self.config_path.read_bytes()
+            signature = (self.config_path.stat().st_mtime_ns, _hash_config_bytes(raw_bytes))
+            if signature == self._active_signature:
+                self._pending_signature = None
+                return
+            if signature != self._pending_signature:
+                self._pending_signature = signature
+                return
+            self._pending_signature = None
+            new_config = RelayConfig.load(self.config_path)
+            current_runtime = self.runtime_manager.active_runtime()
+            current_config = current_runtime.config
+            if (
+                new_config.listen_host != current_config.listen_host
+                or new_config.listen_port != current_config.listen_port
+            ):
+                self._reload_listener_runtime(new_config, signature[1])
+                self._active_signature = signature
+                return
+            if Path(new_config.database_path) != Path(current_config.database_path):
+                self._reload_database_runtime(new_config, signature[1])
+                self._active_signature = signature
+                return
+            if (
+                new_config.listen_host == current_config.listen_host
+                and new_config.listen_port == current_config.listen_port
+                and Path(new_config.database_path) == Path(current_config.database_path)
+            ):
+                self.runtime_manager.swap_runtime(
+                    RelayRuntime(
+                        config=new_config,
+                        usage_store=current_runtime.usage_store,
+                        config_version=signature[1],
+                        close_usage_store_when_drained=False,
+                    )
+                )
+                self._active_signature = signature
+                return
+            raise RuntimeError("runtime-only reload path received infrastructure change")
+        except Exception as exc:
+            self.runtime_manager.record_reload_error(str(exc))
 
 
 def plan_request_attempts(config: RelayConfig, headers: Any, request_body: bytes) -> RequestPlan:
@@ -1294,6 +1577,10 @@ def _decrement_counter(counter: dict[str, int], key: str | None) -> None:
     counter[key] = current - 1
 
 
+def _hash_config_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local API relay")
     parser.add_argument("--config", required=True, help="Path to relay config JSON")
@@ -1302,16 +1589,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = RelayConfig.load(args.config)
-    usage_store = UsageStore(config.database_path)
-    server = RelayHTTPServer((config.listen_host, config.listen_port), RelayRequestHandler, config, usage_store)
+    service = RelayService(args.config)
     try:
-        server.serve_forever()
+        service.serve_forever()
     except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        usage_store.close()
+        service.shutdown()
 
 
 if __name__ == "__main__":

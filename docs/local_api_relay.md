@@ -154,6 +154,26 @@ PYTHONDONTWRITEBYTECODE=1 python3 local_api_relay.py --config local_api_relay.js
 
 - `http://127.0.0.1:8787`
 
+## 自动热重载
+
+relay 会自动轮询 `local_api_relay.json`。
+
+- 轮询间隔默认是 1 秒
+- 文件内容连续两次观察一致后才会真正尝试 reload，避免编辑器写入过程中的半成品配置被误吃进去
+- `upstreams`、`order`、`local.clients`、`idle_window_seconds`、`request_timeout_seconds` 这类运行期配置会直接切到新 runtime
+- `database_path` 变化会新建 SQLite 连接，后续请求写入新库，旧请求继续收尾到旧库
+- `listen_host` / `listen_port` 变化会拉起新的 listener 并切走流量，旧端口随后退役
+
+reload 失败时不会把当前可用 relay 打挂。典型失败场景包括：
+
+- JSON 非法
+- schema 校验失败
+- `order` 引用了不存在的 upstream
+- 新数据库打不开
+- 新 host/port 绑定失败
+
+发生这些错误时，relay 会继续使用旧配置服务，并把最近一次 reload 错误写到 `/_relay/health`。
+
 ## 客户端接入
 
 客户端只需要改两项：
@@ -195,6 +215,19 @@ X-Relay-Admin-Key: <admin_key>
 - `local`
 - `upstreams`
 - `order`
+- `reload`
+
+其中 `reload` 至少包含：
+
+- `config_path`
+- `config_version`
+- `reload_enabled`
+- `reload_poll_interval_seconds`
+- `last_reload_at`
+- `last_reload_status`
+- `last_reload_error`
+- `last_successful_reload_at`
+- `draining_runtimes`
 
 ### `/_relay/stats`
 
