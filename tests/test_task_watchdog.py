@@ -199,7 +199,7 @@ class TaskWatchdogTests(unittest.TestCase):
         self.assertEqual(updated_task.status, "BLOCKED")
         self.assertIn("4a -> BLOCKED", render_notify_text(decision))
 
-    def test_decide_watchdog_tick_returns_no_reply_when_only_relay_is_active(self) -> None:
+    def test_decide_watchdog_tick_returns_no_reply_when_only_relay_is_active_and_task_board_is_recent(self) -> None:
         snapshot = TaskStateSnapshot(
             updated_at=NOW - timedelta(minutes=5),
             active_task_id="4a",
@@ -209,7 +209,7 @@ class TaskWatchdogTests(unittest.TestCase):
                     status="DOING",
                     progress=90,
                     last_progress_at=NOW - timedelta(hours=2),
-                    heartbeat_at=NOW - timedelta(minutes=20),
+                    heartbeat_at=NOW - timedelta(minutes=5),
                     blocker="",
                     next_action="继续推进",
                     done_criteria="规则可执行",
@@ -232,6 +232,42 @@ class TaskWatchdogTests(unittest.TestCase):
         self.assertEqual(decision.reason, "doing")
         self.assertFalse(decision.changed)
         self.assertEqual(render_notify_text(decision), "")
+        updated_task = find_active_task(decision.updated_snapshot)
+        self.assertEqual(updated_task.heartbeat_at, NOW - timedelta(minutes=5))
+
+    def test_decide_watchdog_tick_requests_resume_when_relay_is_active_but_task_board_is_stale(self) -> None:
+        snapshot = TaskStateSnapshot(
+            updated_at=NOW - timedelta(minutes=5),
+            active_task_id="4a",
+            tasks=[
+                TaskRecord(
+                    task_id="4a",
+                    status="DOING",
+                    progress=90,
+                    last_progress_at=NOW - timedelta(hours=2),
+                    heartbeat_at=NOW - timedelta(minutes=20),
+                    blocker="",
+                    next_action="补齐测试",
+                    done_criteria="规则可执行",
+                )
+            ],
+            source="tasks_json",
+        )
+
+        decision = decide_watchdog_tick(
+            snapshot,
+            NOW,
+            relay_activity=RelayClientActivity(
+                client_id="openclaw",
+                last_request_at=NOW - timedelta(minutes=3),
+                last_success_at=NOW - timedelta(minutes=8),
+            ),
+        )
+
+        self.assertEqual(decision.action, RESUME_TASK)
+        self.assertEqual(decision.reason, "resume_task")
+        self.assertTrue(decision.changed)
+        self.assertIn("恢复任务 4a", render_notify_text(decision))
 
     def test_decide_watchdog_tick_switches_first_todo_in_original_order(self) -> None:
         snapshot = TaskStateSnapshot(

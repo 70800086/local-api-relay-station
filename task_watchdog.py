@@ -306,8 +306,6 @@ def decide_watchdog_tick(
     if active_task:
         assessment = assess_task_activity(active_task, now, relay_activity=relay_activity)
         if assessment.is_active:
-            if assessment.relay_active and not assessment.task_board_active:
-                active_task.heartbeat_at = now
             return TickDecision(
                 action=NO_REPLY,
                 reason="doing",

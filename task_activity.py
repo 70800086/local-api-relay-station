@@ -57,7 +57,7 @@ def assess_task_activity(
             reason=task_board_reason,
         )
 
-    relay_reason = _relay_activity_reason(relay_activity, now)
+    relay_reason = _relay_activity_reason(relay_activity, now, task=task)
     if relay_reason is not None:
         return ActivityAssessment(
             is_active=True,
@@ -213,9 +213,20 @@ def _task_board_activity_reason(
     return None
 
 
-def _relay_activity_reason(activity: RelayClientActivity | None, now: datetime) -> str | None:
+def _relay_activity_reason(
+    activity: RelayClientActivity | None,
+    now: datetime,
+    *,
+    task: TaskLike | None = None,
+) -> str | None:
     if activity is None:
         return None
+
+    if task is not None:
+        if task.heartbeat_at is None:
+            return None
+        if now - task.heartbeat_at > TASK_BOARD_HEARTBEAT_WINDOW:
+            return None
 
     if activity.last_request_at is not None and now - activity.last_request_at <= RELAY_REQUEST_ACTIVITY_WINDOW:
         return "relay_recent_request"
