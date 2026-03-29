@@ -49,16 +49,15 @@ python3 task_watchdog_runner.py --json --resume-codex --codex-workdir /root/.ope
 
 当前推荐的 systemd service 默认参数：
 
-- 保持 `task_watchdog_runner.py --json`
-- **先不要默认加** `--resume-codex`
+- 使用 `task_watchdog_runner.py --json --resume-codex --codex-workdir /root/.openclaw/workspace --codex-cooldown-minutes 15`
 
 原因：
 
 - 现版本已能输出结构化 `RESUME_TASK` / `NOTIFY_ONLY` 事件
-- 自动拉起 Codex 已具备能力，但属于更激进的执行策略
-- 建议先以“结构化恢复事件 + 人工观察”模式上线，再按需要打开 `--resume-codex`
+- `RESUME_TASK` 已通过本地真实触发验证，可自动执行恢复命令并写入 cooldown 状态
+- 冷却保护可避免 timer 周期内对同一任务反复拉起
 
-若后续要开启自动恢复 Codex，建议在 service 中追加：
+默认启用的关键参数：
 
 ```bash
 --resume-codex --codex-workdir /root/.openclaw/workspace --codex-cooldown-minutes 15

@@ -7,7 +7,6 @@ Wants=network-online.target
 Type=oneshot
 Environment=PATH=/root/.nvm/versions/node/v22.22.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WorkingDirectory=/root/.openclaw/workspace
-# Safe default: emit structured watchdog events, but do not auto-launch Codex.
-# To enable Codex auto-resume later, append for example:
-#   --resume-codex --codex-workdir /root/.openclaw/workspace --codex-cooldown-minutes 15
-ExecStart=/usr/bin/env python3 /root/.openclaw/workspace/task_watchdog_runner.py --json
+# Default: emit structured watchdog events and auto-resume Codex for RESUME_TASK.
+# Cooldown state is persisted under state/watchdog_codex_resume.json.
+ExecStart=/usr/bin/env python3 /root/.openclaw/workspace/task_watchdog_runner.py --json --resume-codex --codex-workdir /root/.openclaw/workspace --codex-cooldown-minutes 15
