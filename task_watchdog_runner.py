@@ -17,7 +17,6 @@ from task_watchdog import (
     RESUME_TASK,
     TickDecision,
     _parse_now,
-    run_watchdog_tick,
 )
 
 TASKS_SERVICE_SRC = Path(__file__).resolve().parent / "tasks-service" / "src"
@@ -350,24 +349,15 @@ def run_timer_watchdog(
     run_fn: Any = subprocess.run,
     codex_config: CodexResumeConfig | None = None,
 ) -> RunnerResult:
-    watchdog_kwargs = {"now": now, "json_path": tasks_json, "md_path": tasks_md}
-    if relay_activity is not ...:
-        watchdog_kwargs["relay_activity"] = relay_activity
-    watchdog_kwargs["load_relay"] = load_relay
     decision_route = "direct"
     fallback_reason = None
-    try:
-        decision = _run_watchdog_tick_direct(
-            now=now,
-            json_path=tasks_json,
-            md_path=tasks_md,
-            relay_activity=None if relay_activity is ... else relay_activity,
-            load_relay=load_relay,
-        )
-    except Exception as exc:
-        decision_route = "fallback"
-        fallback_reason = f"{type(exc).__name__}: {exc}"
-        decision = run_watchdog_tick(**watchdog_kwargs)
+    decision = _run_watchdog_tick_direct(
+        now=now,
+        json_path=tasks_json,
+        md_path=tasks_md,
+        relay_activity=None if relay_activity is ... else relay_activity,
+        load_relay=load_relay,
+    )
     dispatched_command = None
     event_dispatched = False
     dispatch_error = None
