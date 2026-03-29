@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import select
@@ -446,6 +447,130 @@ class UsageStore:
                 "last_success_at_local": _to_local_isoformat(row["last_success_at"]),
             },
         }
+
+
+@dataclass
+class RelayRuntime:
+    config: RelayConfig
+    usage_store: UsageStore
+    config_version: str
+    close_usage_store_when_drained: bool
+    active_requests: int = 0
+
+
+@dataclass
+class ReloadState:
+    config_path: Path
+    config_version: str
+    reload_enabled: bool
+    reload_poll_interval_seconds: float
+    last_reload_at: str | None = None
+    last_reload_status: str = "never"
+    last_reload_error: str | None = None
+    last_successful_reload_at: str | None = None
+
+    def as_dict(self, *, draining_runtimes: int) -> dict[str, Any]:
+        return {
+            "config_path": str(self.config_path),
+            "config_version": self.config_version,
+            "reload_enabled": self.reload_enabled,
+            "reload_poll_interval_seconds": self.reload_poll_interval_seconds,
+            "last_reload_at": self.last_reload_at,
+            "last_reload_status": self.last_reload_status,
+            "last_reload_error": self.last_reload_error,
+            "last_successful_reload_at": self.last_successful_reload_at,
+            "draining_runtimes": draining_runtimes,
+        }
+
+
+class RuntimeLease:
+    def __init__(self, manager: "RelayRuntimeManager", runtime: RelayRuntime) -> None:
+        self._manager = manager
+        self._runtime = runtime
+        self._closed = False
+
+    @property
+    def config(self) -> RelayConfig:
+        return self._runtime.config
+
+    @property
+    def usage_store(self) -> UsageStore:
+        return self._runtime.usage_store
+
+    @property
+    def config_version(self) -> str:
+        return self._runtime.config_version
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._manager.release_runtime(self._runtime)
+
+
+class RelayRuntimeManager:
+    def __init__(
+        self,
+        *,
+        config_path: Path,
+        active_runtime: RelayRuntime,
+        reload_poll_interval_seconds: float,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._active_runtime = active_runtime
+        self._draining_runtimes: list[RelayRuntime] = []
+        self._reload_state = ReloadState(
+            config_path=config_path,
+            config_version=active_runtime.config_version,
+            reload_enabled=True,
+            reload_poll_interval_seconds=reload_poll_interval_seconds,
+        )
+
+    def acquire_runtime(self) -> RuntimeLease:
+        with self._lock:
+            self._active_runtime.active_requests += 1
+            return RuntimeLease(self, self._active_runtime)
+
+    def release_runtime(self, runtime: RelayRuntime) -> None:
+        stores_to_close: list[UsageStore] = []
+        with self._lock:
+            runtime.active_requests = max(0, runtime.active_requests - 1)
+            survivors: list[RelayRuntime] = []
+            for retired in self._draining_runtimes:
+                if retired.active_requests == 0:
+                    if retired.close_usage_store_when_drained:
+                        stores_to_close.append(retired.usage_store)
+                    continue
+                survivors.append(retired)
+            self._draining_runtimes = survivors
+        for store in stores_to_close:
+            store.close()
+
+    def reload_state_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return self._reload_state.as_dict(draining_runtimes=len(self._draining_runtimes))
+
+    def active_runtime(self) -> RelayRuntime:
+        with self._lock:
+            return self._active_runtime
+
+    def swap_runtime(self, runtime: RelayRuntime) -> None:
+        with self._lock:
+            retired = self._active_runtime
+            self._active_runtime = runtime
+            self._reload_state.config_version = runtime.config_version
+            self._reload_state.last_reload_at = datetime.now(timezone.utc).isoformat()
+            self._reload_state.last_reload_status = "success"
+            self._reload_state.last_reload_error = None
+            self._reload_state.last_successful_reload_at = self._reload_state.last_reload_at
+            if retired is not runtime:
+                self._draining_runtimes.append(retired)
+
+    def record_reload_error(self, message: str) -> None:
+        with self._lock:
+            self._reload_state.last_reload_at = datetime.now(timezone.utc).isoformat()
+            self._reload_state.last_reload_status = "error"
+            self._reload_state.last_reload_error = message
 
 
 class RelayHTTPServer(ThreadingHTTPServer):
@@ -1292,6 +1417,10 @@ def _decrement_counter(counter: dict[str, int], key: str | None) -> None:
         counter.pop(key, None)
         return
     counter[key] = current - 1
+
+
+def _hash_config_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
 
 
 def parse_args() -> argparse.Namespace:

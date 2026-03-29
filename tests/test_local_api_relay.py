@@ -219,6 +219,42 @@ class RelayServer:
         self.usage_store.close()
 
 
+class RelayRuntimeManagerTests(unittest.TestCase):
+    def test_runtime_manager_tracks_runtime_lease_and_reload_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "relay-config.json"
+            payload = make_config_payload(
+                listen_port=find_free_port(),
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            config = relay.RelayConfig.load(config_path)
+            store = relay.UsageStore(Path(tmp_dir) / "relay.sqlite3")
+            try:
+                runtime = relay.RelayRuntime(
+                    config=config,
+                    usage_store=store,
+                    config_version=relay._hash_config_bytes(config_path.read_bytes()),
+                    close_usage_store_when_drained=False,
+                )
+                manager = relay.RelayRuntimeManager(
+                    config_path=config_path,
+                    active_runtime=runtime,
+                    reload_poll_interval_seconds=1.0,
+                )
+
+                lease = manager.acquire_runtime()
+                self.assertEqual(lease.config.order, ["primary", "backup"])
+                self.assertEqual(runtime.active_requests, 1)
+                self.assertEqual(manager.reload_state_snapshot()["last_reload_status"], "never")
+                self.assertEqual(manager.reload_state_snapshot()["draining_runtimes"], 0)
+                lease.close()
+                self.assertEqual(runtime.active_requests, 0)
+            finally:
+                store.close()
+
+
 class RelayPlanningTests(unittest.TestCase):
     def write_config(self, tmp_dir: str, payload: dict[str, Any]) -> Path:
         config_path = Path(tmp_dir) / "relay-config.json"
