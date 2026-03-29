@@ -19,7 +19,9 @@ VALID_STATUSES = {"TODO", "DOING", "BLOCKED", "DONE"}
 STRUCTURAL_FIELDS = ("status", "progress", "blocker", "next_action", "done_criteria")
 CONFLICT_FIELDS = ("status", "progress", "next_action", "done_criteria")
 NO_REPLY = "NO_REPLY"
-NOTIFY = "NOTIFY"
+RESUME_TASK = "RESUME_TASK"
+NOTIFY_ONLY = "NOTIFY_ONLY"
+NOTIFY = NOTIFY_ONLY
 
 
 class TaskStateLoadError(Exception):
@@ -329,7 +331,7 @@ def decide_watchdog_tick(
             updated_snapshot.updated_at = now
             notify_text = _render_task_status_change(active_task, previous_status="DOING")
             return TickDecision(
-                action=NOTIFY,
+                action=NOTIFY_ONLY,
                 reason="blocked",
                 changed=True,
                 notify_text=notify_text,
@@ -351,13 +353,12 @@ def decide_watchdog_tick(
                 updated_snapshot=updated_snapshot,
             )
 
-        active_task.status = "BLOCKED"
-        active_task.blocker = "当前 `next_action` 无法再缩小，需先补明确阻塞或拆成更小子任务"
+        active_task.heartbeat_at = now
         updated_snapshot.updated_at = now
-        notify_text = _render_task_status_change(active_task, previous_status="DOING")
+        notify_text = _render_resume_task_text(active_task)
         return TickDecision(
-            action=NOTIFY,
-            reason="blocked",
+            action=RESUME_TASK,
+            reason="resume_task",
             changed=True,
             notify_text=notify_text,
             updated_snapshot=updated_snapshot,
@@ -372,10 +373,10 @@ def decide_watchdog_tick(
         updated_snapshot.active_task_id = next_task.task_id
         updated_snapshot.updated_at = now
         return TickDecision(
-            action=NOTIFY,
+            action=RESUME_TASK,
             reason="switch_task",
             changed=True,
-            notify_text=_render_task_status_change(next_task, previous_status=previous_status),
+            notify_text=_render_resume_task_text(next_task, previous_status=previous_status),
             updated_snapshot=updated_snapshot,
         )
 
@@ -610,6 +611,14 @@ def _render_task_status_change(task: TaskRecord, previous_status: str) -> str:
     return (
         f"{task.task_id} -> {task.status}（{previous_status} / {progress_text}）："
         f"下一步：{task.next_action}。完成标准：{task.done_criteria}"
+    )
+
+
+def _render_resume_task_text(task: TaskRecord, previous_status: str | None = None) -> str:
+    status_note = f"（{previous_status} -> {task.status}）" if previous_status else f"（{task.status}）"
+    return (
+        f"恢复任务 {task.task_id}{status_note}："
+        f"优先继续下一步：{task.next_action}。完成标准：{task.done_criteria}"
     )
 
 

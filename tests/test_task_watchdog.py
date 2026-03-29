@@ -6,6 +6,8 @@ from tempfile import TemporaryDirectory
 from zoneinfo import ZoneInfo
 
 from task_watchdog import (
+    NOTIFY_ONLY,
+    RESUME_TASK,
     TaskRecord,
     TaskStateSnapshot,
     decide_watchdog_tick,
@@ -191,7 +193,7 @@ class TaskWatchdogTests(unittest.TestCase):
         )
         updated_task = find_active_task(decision.updated_snapshot)
 
-        self.assertEqual(decision.action, "NOTIFY")
+        self.assertEqual(decision.action, NOTIFY_ONLY)
         self.assertEqual(decision.reason, "blocked")
         self.assertTrue(decision.changed)
         self.assertEqual(updated_task.status, "BLOCKED")
@@ -273,12 +275,46 @@ class TaskWatchdogTests(unittest.TestCase):
         decision = decide_watchdog_tick(snapshot, NOW)
         updated_task = find_active_task(decision.updated_snapshot)
 
-        self.assertEqual(decision.action, "NOTIFY")
+        self.assertEqual(decision.action, RESUME_TASK)
         self.assertEqual(decision.reason, "switch_task")
         self.assertEqual(decision.updated_snapshot.active_task_id, "5a")
         self.assertEqual(updated_task.status, "DOING")
         self.assertEqual(updated_task.progress, 0)
-        self.assertIn("5a -> DOING", render_notify_text(decision))
+        self.assertIn("恢复任务 5a", render_notify_text(decision))
+
+    def test_decide_watchdog_tick_requests_resume_when_stale_task_has_no_blocker_and_no_smaller_step(self) -> None:
+        snapshot = TaskStateSnapshot(
+            updated_at=NOW - timedelta(minutes=5),
+            active_task_id="4a",
+            tasks=[
+                TaskRecord(
+                    task_id="4a",
+                    status="DOING",
+                    progress=90,
+                    last_progress_at=NOW - timedelta(hours=2),
+                    heartbeat_at=NOW - timedelta(minutes=5),
+                    blocker="",
+                    next_action="补齐测试",
+                    done_criteria="规则可执行",
+                )
+            ],
+            source="tasks_json",
+        )
+
+        decision = decide_watchdog_tick(
+            snapshot,
+            NOW,
+            relay_activity=RelayClientActivity(
+                client_id="openclaw",
+                last_request_at=NOW - timedelta(hours=2),
+                last_success_at=NOW - timedelta(hours=2),
+            ),
+        )
+
+        self.assertEqual(decision.action, RESUME_TASK)
+        self.assertEqual(decision.reason, "resume_task")
+        self.assertTrue(decision.changed)
+        self.assertIn("恢复任务 4a", render_notify_text(decision))
 
     def test_sync_snapshot_if_needed_skips_write_for_heartbeat_only_change(self) -> None:
         with TemporaryDirectory() as tmp_dir:
