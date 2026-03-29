@@ -554,9 +554,11 @@ class RelayRuntimeManager:
         with self._lock:
             return self._active_runtime
 
-    def swap_runtime(self, runtime: RelayRuntime) -> None:
+    def swap_runtime(self, runtime: RelayRuntime, *, close_retired_usage_store: bool = False) -> None:
+        stores_to_close: list[UsageStore] = []
         with self._lock:
             retired = self._active_runtime
+            retired.close_usage_store_when_drained = retired.close_usage_store_when_drained or close_retired_usage_store
             self._active_runtime = runtime
             self._reload_state.config_version = runtime.config_version
             self._reload_state.last_reload_at = datetime.now(timezone.utc).isoformat()
@@ -564,7 +566,13 @@ class RelayRuntimeManager:
             self._reload_state.last_reload_error = None
             self._reload_state.last_successful_reload_at = self._reload_state.last_reload_at
             if retired is not runtime:
-                self._draining_runtimes.append(retired)
+                if retired.active_requests == 0:
+                    if retired.close_usage_store_when_drained:
+                        stores_to_close.append(retired.usage_store)
+                else:
+                    self._draining_runtimes.append(retired)
+        for store in stores_to_close:
+            store.close()
 
     def record_reload_error(self, message: str) -> None:
         with self._lock:
@@ -1034,6 +1042,16 @@ class RelayService:
         while not self._stop_event.wait(self.reload_poll_interval_seconds):
             self._maybe_reload()
 
+    def _reload_database_runtime(self, new_config: RelayConfig, config_version: str) -> None:
+        new_store = UsageStore(new_config.database_path)
+        new_runtime = RelayRuntime(
+            config=new_config,
+            usage_store=new_store,
+            config_version=config_version,
+            close_usage_store_when_drained=True,
+        )
+        self.runtime_manager.swap_runtime(new_runtime, close_retired_usage_store=True)
+
     def _maybe_reload(self) -> None:
         try:
             raw_bytes = self.config_path.read_bytes()
@@ -1048,6 +1066,10 @@ class RelayService:
             new_config = RelayConfig.load(self.config_path)
             current_runtime = self.runtime_manager.active_runtime()
             current_config = current_runtime.config
+            if Path(new_config.database_path) != Path(current_config.database_path):
+                self._reload_database_runtime(new_config, signature[1])
+                self._active_signature = signature
+                return
             if (
                 new_config.listen_host == current_config.listen_host
                 and new_config.listen_port == current_config.listen_port

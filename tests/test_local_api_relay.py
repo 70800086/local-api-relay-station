@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import http.client
 import json
+import sqlite3
 import socket
 import tempfile
 import threading
@@ -640,6 +641,66 @@ class RelayHotReloadTests(unittest.TestCase):
                     headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
                 )
                 self.assertEqual(status, 200)
+
+    def test_database_path_reload_switches_new_requests_to_new_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with UpstreamServer() as upstream:
+                port = find_free_port()
+                first_db = Path(tmp_dir) / "relay.sqlite3"
+                second_db = Path(tmp_dir) / "relay-next.sqlite3"
+                config_path = Path(tmp_dir) / "relay-config.json"
+                payload = make_config_payload(
+                    listen_port=port,
+                    database_path=str(first_db),
+                    upstream_base_urls={
+                        "primary": f"http://127.0.0.1:{upstream.port}/v1",
+                        "backup": f"http://127.0.0.1:{upstream.port}/v1",
+                    },
+                )
+                self.write_config(config_path, payload)
+
+                with RelayServiceHarness(config_path):
+                    RecordingUpstreamHandler.queue_responses({"status": 201}, {"status": 201})
+                    first_status, _, _ = make_request(
+                        port,
+                        "POST",
+                        "/v1/chat/completions",
+                        headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
+                        body=b'{"model":"gpt-test","messages":[]}',
+                    )
+                    self.assertEqual(first_status, 201)
+
+                    payload["server"]["database_path"] = str(second_db)
+                    self.write_config(config_path, payload)
+
+                    def switched() -> bool:
+                        status, _, response = make_request(
+                            port,
+                            "GET",
+                            "/_relay/health",
+                            headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                        )
+                        health = json.loads(response)
+                        return status == 200 and health["server"]["database_path"] == str(second_db)
+
+                    wait_for(switched)
+
+                    second_status, _, _ = make_request(
+                        port,
+                        "POST",
+                        "/v1/chat/completions",
+                        headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
+                        body=b'{"model":"gpt-test","messages":[]}',
+                    )
+                    self.assertEqual(second_status, 201)
+
+            with sqlite3.connect(first_db) as first_conn:
+                first_count = first_conn.execute(f"SELECT COUNT(*) FROM {relay.REQUEST_LOG_TABLE}").fetchone()[0]
+            with sqlite3.connect(second_db) as second_conn:
+                second_count = second_conn.execute(f"SELECT COUNT(*) FROM {relay.REQUEST_LOG_TABLE}").fetchone()[0]
+
+        self.assertEqual(first_count, 1)
+        self.assertEqual(second_count, 1)
 
 
 class LocalApiRelayIntegrationTests(unittest.TestCase):
