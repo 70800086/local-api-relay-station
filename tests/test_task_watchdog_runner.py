@@ -186,6 +186,8 @@ class TaskWatchdogRunnerTests(unittest.TestCase):
 
             self.assertTrue(result.event_dispatched)
             self.assertEqual(result.decision_action, "NOTIFY_ONLY")
+            self.assertEqual(result.decision_route, "direct")
+            self.assertIsNone(result.fallback_reason)
             run_fn.assert_called_once()
             called_command = run_fn.call_args.args[0]
             self.assertIn("openclaw", called_command[0])
@@ -306,6 +308,8 @@ class TaskWatchdogRunnerTests(unittest.TestCase):
 
             self.assertTrue(result.event_dispatched)
             self.assertEqual(result.decision_action, "RESUME_TASK")
+            self.assertEqual(result.decision_route, "direct")
+            self.assertIsNone(result.fallback_reason)
             called_command = run_fn.call_args.args[0]
             self.assertIn("--text", called_command)
             event_text = called_command[called_command.index("--text") + 1]
@@ -487,6 +491,8 @@ class TaskWatchdogRunnerTests(unittest.TestCase):
 
             self.assertFalse(result.event_dispatched)
             self.assertEqual(result.decision_action, "NO_REPLY")
+            self.assertEqual(result.decision_route, "direct")
+            self.assertIsNone(result.fallback_reason)
             run_fn.assert_not_called()
 
 

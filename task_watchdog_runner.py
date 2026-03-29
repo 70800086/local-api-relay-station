@@ -4,20 +4,31 @@ import argparse
 import json
 import shlex
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from task_activity import RelayClientActivity, load_local_relay_activity
 from task_watchdog import (
     NO_REPLY,
     NOTIFY_ONLY,
     RESUME_TASK,
     TickDecision,
     _parse_now,
-    find_active_task,
     run_watchdog_tick,
 )
+
+TASKS_SERVICE_SRC = Path(__file__).resolve().parent / "tasks-service" / "src"
+if TASKS_SERVICE_SRC.exists() and str(TASKS_SERVICE_SRC) not in sys.path:
+    sys.path.insert(0, str(TASKS_SERVICE_SRC))
+
+from tasks_service.models import ActivitySignal
+from tasks_service.policy import TaskPolicy
+from tasks_service.service import TasksService
+from tasks_service.sync import load_authoritative_snapshot as ts_load_authoritative_snapshot
+from tasks_service.sync import sync_snapshot_if_needed as ts_sync_snapshot_if_needed
 
 
 @dataclass(frozen=True)
@@ -47,6 +58,8 @@ class RunnerResult:
     notify_text: str
     event_dispatched: bool
     dispatched_command: list[str] | None
+    decision_route: str = "compat"
+    fallback_reason: str | None = None
     codex_resumed: bool = False
     codex_command: list[str] | None = None
     codex_skipped: bool = False
@@ -56,6 +69,63 @@ class RunnerResult:
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _get_active_task(snapshot: Any) -> Any | None:
+    active_task_id = getattr(snapshot, "active_task_id", "")
+    tasks = getattr(snapshot, "tasks", []) or []
+    if not active_task_id:
+        return None
+    for task in tasks:
+        if getattr(task, "task_id", None) == active_task_id:
+            return task
+    return None
+
+
+def _relay_activity_to_signals(relay_activity: RelayClientActivity | None) -> list[ActivitySignal]:
+    if relay_activity is None:
+        return []
+    signals: list[ActivitySignal] = []
+    if relay_activity.last_request_at is not None:
+        signals.append(ActivitySignal(source="relay", kind="recent_request", last_seen_at=relay_activity.last_request_at))
+    if relay_activity.last_success_at is not None:
+        signals.append(ActivitySignal(source="relay", kind="recent_success", last_seen_at=relay_activity.last_success_at))
+    return signals
+
+
+class _StaticTaskStore:
+    def __init__(self, snapshot: Any) -> None:
+        self.snapshot = snapshot
+
+    def load_snapshot(self) -> Any:
+        return self.snapshot
+
+    def save_snapshot(self, snapshot: Any) -> None:
+        self.snapshot = snapshot
+
+
+def _run_watchdog_tick_direct(
+    *,
+    now: datetime,
+    json_path: str | Path,
+    md_path: str | Path,
+    relay_activity: RelayClientActivity | None,
+    load_relay: bool,
+) -> TickDecision:
+    snapshot = ts_load_authoritative_snapshot(now, json_path, md_path)
+    if relay_activity is None and load_relay:
+        relay_activity = load_local_relay_activity()
+    signals = _relay_activity_to_signals(relay_activity)
+    service = TasksService(_StaticTaskStore(snapshot), TaskPolicy())
+    decision = service.decide_tick(now, signals=signals)
+    ts_sync_snapshot_if_needed(decision.snapshot, json_path)
+    return TickDecision(
+        action=decision.action,
+        reason=decision.reason,
+        changed=decision.changed,
+        notify_text=decision.notify_text,
+        updated_snapshot=decision.snapshot,
+    )
 
 
 def load_gateway_event_config(config_path: str | Path = Path("/root/.openclaw/openclaw.json")) -> EventDispatchConfig:
@@ -79,8 +149,8 @@ def load_gateway_event_config(config_path: str | Path = Path("/root/.openclaw/op
     )
 
 
-def build_system_event_text(decision: TickDecision) -> str:
-    active_task = find_active_task(decision.updated_snapshot)
+def build_system_event_text(decision: Any) -> str:
+    active_task = _get_active_task(decision.updated_snapshot)
     lines = [
         "watchdog-triggered system check",
         f"action: {decision.action}",
@@ -135,7 +205,7 @@ def build_system_event_command(
 
 
 def dispatch_system_event(
-    decision: TickDecision,
+    decision: Any,
     *,
     config: EventDispatchConfig,
     run_fn: Any = subprocess.run,
@@ -146,8 +216,8 @@ def dispatch_system_event(
     return command
 
 
-def build_codex_resume_prompt(decision: TickDecision) -> str:
-    active_task = find_active_task(decision.updated_snapshot)
+def build_codex_resume_prompt(decision: Any) -> str:
+    active_task = _get_active_task(decision.updated_snapshot)
     if active_task is None:
         raise ValueError("Cannot resume Codex without an active task")
 
@@ -169,7 +239,7 @@ def build_codex_resume_prompt(decision: TickDecision) -> str:
     )
 
 
-def build_codex_resume_command(decision: TickDecision, *, config: CodexResumeConfig) -> list[str]:
+def build_codex_resume_command(decision: Any, *, config: CodexResumeConfig) -> list[str]:
     prompt = build_codex_resume_prompt(decision)
     command = shlex.split(config.command)
     command.append(prompt)
@@ -204,12 +274,12 @@ def save_codex_resume_state(path: str | Path, state: dict[str, Any]) -> None:
 
 
 def should_skip_codex_resume(
-    decision: TickDecision,
+    decision: Any,
     *,
     config: CodexResumeConfig,
     now: datetime,
 ) -> tuple[bool, str | None]:
-    active_task = find_active_task(decision.updated_snapshot)
+    active_task = _get_active_task(decision.updated_snapshot)
     if active_task is None:
         return True, "missing_active_task"
 
@@ -235,8 +305,8 @@ def should_skip_codex_resume(
     return False, None
 
 
-def mark_codex_resume_started(decision: TickDecision, *, config: CodexResumeConfig, now: datetime) -> None:
-    active_task = find_active_task(decision.updated_snapshot)
+def mark_codex_resume_started(decision: Any, *, config: CodexResumeConfig, now: datetime) -> None:
+    active_task = _get_active_task(decision.updated_snapshot)
     if active_task is None:
         return
     state_path = Path(config.state_path) if config.state_path else _default_codex_state_path(config)
@@ -251,7 +321,7 @@ def mark_codex_resume_started(decision: TickDecision, *, config: CodexResumeConf
 
 
 def resume_with_codex(
-    decision: TickDecision,
+    decision: Any,
     *,
     config: CodexResumeConfig,
     run_fn: Any = subprocess.run,
@@ -284,7 +354,20 @@ def run_timer_watchdog(
     if relay_activity is not ...:
         watchdog_kwargs["relay_activity"] = relay_activity
     watchdog_kwargs["load_relay"] = load_relay
-    decision = run_watchdog_tick(**watchdog_kwargs)
+    decision_route = "direct"
+    fallback_reason = None
+    try:
+        decision = _run_watchdog_tick_direct(
+            now=now,
+            json_path=tasks_json,
+            md_path=tasks_md,
+            relay_activity=None if relay_activity is ... else relay_activity,
+            load_relay=load_relay,
+        )
+    except Exception as exc:
+        decision_route = "fallback"
+        fallback_reason = f"{type(exc).__name__}: {exc}"
+        decision = run_watchdog_tick(**watchdog_kwargs)
     dispatched_command = None
     event_dispatched = False
     dispatch_error = None
@@ -337,6 +420,8 @@ def run_timer_watchdog(
         notify_text=decision.notify_text,
         event_dispatched=event_dispatched,
         dispatched_command=dispatched_command,
+        decision_route=decision_route,
+        fallback_reason=fallback_reason,
         codex_resumed=codex_resumed,
         codex_command=codex_command,
         codex_skipped=codex_skipped,
