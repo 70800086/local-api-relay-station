@@ -399,13 +399,15 @@ class RelayPlanningTests(unittest.TestCase):
         self.assertEqual(missing_upstreams_plan.error_kind, "no_enabled_upstreams")
         self.assertEqual(missing_upstreams_plan.attempts, [])
 
-    def test_should_retry_with_fallback_only_for_5xx_and_obvious_model_mismatch_4xx(self) -> None:
+    def test_should_retry_with_fallback_for_transient_or_routable_failures_only(self) -> None:
+        self.assertFalse(relay._should_retry_with_fallback(201, "", b"", "gpt-test"))
         self.assertTrue(relay._should_retry_with_fallback(500, "", b"", "gpt-test"))
+        self.assertTrue(relay._should_retry_with_fallback(429, "", b"", "gpt-test"))
         self.assertTrue(
             relay._should_retry_with_fallback(
-                400,
+                403,
                 "application/json",
-                b'{"error":{"message":"Model gpt-test is not supported here"}}',
+                b'{"error":{"message":"403 \\u60a8\\u7684\\u5957\\u9910\\u5df2\\u7ecf\\u5230\\u671f\\u6216\\u8005\\u989d\\u5ea6\\u7528\\u5b8c"}}',
                 "gpt-test",
             )
         )
@@ -419,17 +421,17 @@ class RelayPlanningTests(unittest.TestCase):
         )
         self.assertFalse(
             relay._should_retry_with_fallback(
-                403,
+                400,
                 "application/json",
-                b'{"error":{"message":"Your request was blocked."}}',
+                b'{"error":{"message":"bad request"}}',
                 "gpt-test",
             )
         )
         self.assertFalse(
             relay._should_retry_with_fallback(
-                400,
+                403,
                 "application/json",
-                b'{"error":{"message":"bad request"}}',
+                b'{"error":{"message":"Your request was blocked."}}',
                 "gpt-test",
             )
         )
@@ -793,12 +795,12 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
             config_path = self.write_config(tmp_dir, payload)
             RecordingUpstreamHandler.queue_responses(
                 {
-                    "status": 400,
+                    "status": 404,
                     "headers": {
                         "Content-Type": "application/json",
-                        "X-Upstream-Trace": "primary-unsupported",
+                        "X-Upstream-Trace": "primary-no-model",
                     },
-                    "body": b'{"error":{"message":"Model gpt-test is not supported here"}}',
+                    "body": b'{"error":{"message":"No such model: gpt-test"}}',
                 },
                 {
                     "status": 201,
@@ -875,7 +877,7 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
                 self.assertEqual(stats["totals"]["successes"], 1)
                 self.assertEqual(stats["totals"]["failures"], 1)
                 upstream_stats = {item["upstream_id"]: item for item in stats["upstreams"]}
-                self.assertEqual(upstream_stats["primary"]["status_codes"], {"400": 1})
+                self.assertEqual(upstream_stats["primary"]["status_codes"], {"404": 1})
                 self.assertEqual(upstream_stats["backup"]["status_codes"], {"201": 1})
                 self.assertEqual(stats["clients"][0]["client_id"], "chat-client")
                 self.assertEqual(stats["models"][0]["model"], "gpt-test")
@@ -891,7 +893,155 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
                 self.assertFalse(idle["idle"])
                 self.assertEqual(idle["reason"], "recent_successful_requests")
 
-    def test_last_meaningful_error_is_returned_when_later_upstreams_only_hit_gateway_failures(self) -> None:
+    def test_non_routable_400_is_returned_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+            relay_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                upstream_base_urls={
+                    "primary": f"http://127.0.0.1:{upstream.port}/primary",
+                    "backup": f"http://127.0.0.1:{upstream.port}/backup",
+                },
+            )
+            config_path = self.write_config(tmp_dir, payload)
+            RecordingUpstreamHandler.queue_responses(
+                {
+                    "status": 400,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "X-Upstream-Trace": "primary-bad-request",
+                    },
+                    "body": b'{"error":{"message":"bad request"}}',
+                },
+                {
+                    "status": 201,
+                    "headers": dict(DEFAULT_UPSTREAM_HEADERS),
+                    "body": DEFAULT_UPSTREAM_BODY,
+                },
+            )
+
+            with RelayServer(config_path):
+                status, headers, payload = make_request(
+                    relay_port,
+                    "POST",
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=b'{"model":"gpt-test","messages":[]}',
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(headers.get("x-upstream-trace"), "primary-bad-request")
+                self.assertEqual(json.loads(payload)["error"]["message"], "bad request")
+                self.assertEqual(len(RecordingUpstreamHandler.requests), 1)
+
+                stats_status, _, stats_payload = make_request(
+                    relay_port,
+                    "GET",
+                    "/_relay/stats",
+                    headers={"X-Relay-Admin-Key": "relay-admin"},
+                )
+                self.assertEqual(stats_status, 200)
+                stats = json.loads(stats_payload)
+                self.assertEqual(stats["totals"]["requests"], 1)
+                self.assertEqual(stats["totals"]["successes"], 0)
+                self.assertEqual(stats["totals"]["failures"], 1)
+                self.assertEqual(stats["upstreams"][0]["status_codes"], {"400": 1})
+
+    def test_upstream_quota_403_rate_limit_429_and_model_404_fallback_to_backup(self) -> None:
+        scenarios = [
+            (
+                "quota_403",
+                {
+                    "status": 403,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "X-Upstream-Trace": "primary-quota-403",
+                    },
+                    "body": b'{"error":{"message":"403 \\u60a8\\u7684\\u5957\\u9910\\u5df2\\u7ecf\\u5230\\u671f\\u6216\\u8005\\u989d\\u5ea6\\u7528\\u5b8c"}}',
+                },
+            ),
+            (
+                "rate_limit_429",
+                {
+                    "status": 429,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "X-Upstream-Trace": "primary-rate-limit-429",
+                    },
+                    "body": b'{"error":{"message":"rate limit exceeded"}}',
+                },
+            ),
+            (
+                "model_404",
+                {
+                    "status": 404,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "X-Upstream-Trace": "primary-no-model",
+                    },
+                    "body": b'{"error":{"message":"No such model: gpt-test"}}',
+                },
+            ),
+        ]
+
+        for scenario_name, first_response in scenarios:
+            with self.subTest(scenario=scenario_name):
+                with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+                    relay_port = find_free_port()
+                    payload = make_config_payload(
+                        listen_port=relay_port,
+                        database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                        upstream_base_urls={
+                            "primary": f"http://127.0.0.1:{upstream.port}/primary",
+                            "backup": f"http://127.0.0.1:{upstream.port}/backup",
+                        },
+                    )
+                    config_path = self.write_config(tmp_dir, payload)
+                    RecordingUpstreamHandler.queue_responses(
+                        first_response,
+                        {
+                            "status": 201,
+                            "headers": dict(DEFAULT_UPSTREAM_HEADERS),
+                            "body": DEFAULT_UPSTREAM_BODY,
+                        },
+                    )
+
+                    with RelayServer(config_path):
+                        status, headers, response_body = make_request(
+                            relay_port,
+                            "POST",
+                            "/v1/chat/completions",
+                            headers={
+                                "Authorization": "Bearer local-chat-key",
+                                "Content-Type": "application/json",
+                            },
+                            body=b'{"model":"gpt-test","messages":[]}',
+                        )
+                        self.assertEqual(status, 201)
+                        self.assertEqual(headers.get("x-upstream-trace"), "stub-1")
+                        self.assertEqual(response_body, DEFAULT_UPSTREAM_BODY)
+                        self.assertEqual(len(RecordingUpstreamHandler.requests), 2)
+                        self.assertEqual(RecordingUpstreamHandler.requests[0]["path"], "/primary/v1/chat/completions")
+                        self.assertEqual(RecordingUpstreamHandler.requests[1]["path"], "/backup/v1/chat/completions")
+
+                        stats_status, _, stats_payload = make_request(
+                            relay_port,
+                            "GET",
+                            "/_relay/stats",
+                            headers={"X-Relay-Admin-Key": "relay-admin"},
+                        )
+                        self.assertEqual(stats_status, 200)
+                        stats = json.loads(stats_payload)
+                        self.assertEqual(stats["totals"]["requests"], 2)
+                        self.assertEqual(stats["totals"]["successes"], 1)
+                        self.assertEqual(stats["totals"]["failures"], 1)
+                        upstream_stats = {item["upstream_id"]: item for item in stats["upstreams"]}
+                        self.assertEqual(upstream_stats["backup"]["status_codes"], {"201": 1})
+                        self.assertEqual(upstream_stats["primary"]["failures"], 1)
+
         with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
             relay_port = find_free_port()
             unreachable_port = find_free_port()
