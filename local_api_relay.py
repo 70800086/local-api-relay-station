@@ -1181,16 +1181,15 @@ def _should_retry_with_fallback(
 ) -> bool:
     if status_code >= 500:
         return True
-    if status_code < 400 or status_code >= 500:
+    if status_code in {408, 409, 425, 429}:
+        return True
+    if status_code < 400:
         return False
+
     message = _extract_error_message(content_type, response_body).lower()
-    if not message:
-        return False
     requested_model_lower = (requested_model or "").strip().lower()
-    model_hint = "model" in message or (requested_model_lower and requested_model_lower in message)
-    if not model_hint:
-        return False
-    markers = (
+
+    model_markers = (
         "unsupported model",
         "not supported",
         "no such model",
@@ -1204,7 +1203,36 @@ def _should_retry_with_fallback(
         "model unavailable",
         "not available",
     )
-    return any(marker in message for marker in markers)
+    model_hint = "model" in message or (requested_model_lower and requested_model_lower in message)
+    if message and model_hint and any(marker in message for marker in model_markers):
+        return True
+
+    transient_markers = (
+        "quota",
+        "credit",
+        "balance",
+        "billing",
+        "payment",
+        "expired",
+        "套餐",
+        "额度",
+        "用完",
+        "已到期",
+        "rate limit",
+        "too many requests",
+        "try again later",
+        "temporarily unavailable",
+        "temporarily overloaded",
+        "overloaded",
+        "capacity",
+        "server busy",
+        "service unavailable",
+        "engine overloaded",
+    )
+    if message and any(marker in message for marker in transient_markers):
+        return True
+
+    return False
 
 
 def _parse_request_body(request_body: bytes) -> tuple[dict[str, Any] | None, str | None]:
