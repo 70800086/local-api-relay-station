@@ -8,8 +8,8 @@ import select
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -57,6 +57,7 @@ class UpstreamConfig:
 class PlannedUpstreamRequest:
     upstream: UpstreamConfig
     request_body: bytes
+    breaker_permitted: bool = True
 
 
 @dataclass(frozen=True)
@@ -450,11 +451,144 @@ class UsageStore:
 
 
 @dataclass
+class CircuitBreakerState:
+    upstream_id: str
+    state: str = "closed"
+    consecutive_failures: int = 0
+    opened_at: str | None = None
+    cooldown_until: str | None = None
+    half_open_probe_in_flight: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "upstream_id": self.upstream_id,
+            "state": self.state,
+            "consecutive_failures": self.consecutive_failures,
+            "opened_at": self.opened_at,
+            "cooldown_until": self.cooldown_until,
+            "half_open_probe_in_flight": self.half_open_probe_in_flight,
+        }
+
+
+@dataclass
+class CircuitBreakerConfig:
+    failure_threshold: int = 3
+    cooldown_seconds: int = 30
+
+
+@dataclass
+class CircuitBreakerProbeLease:
+    manager: "CircuitBreakerManager"
+    upstream_id: str
+    half_open: bool = False
+    _closed: bool = False
+
+    def mark_success(self) -> None:
+        if self._closed:
+            return
+        self.manager.record_success(self.upstream_id, was_half_open=self.half_open)
+        self._closed = True
+
+    def mark_failure(self) -> None:
+        if self._closed:
+            return
+        self.manager.record_failure(self.upstream_id, was_half_open=self.half_open)
+        self._closed = True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.manager.release_probe(self.upstream_id, was_half_open=self.half_open)
+        self._closed = True
+
+
+class CircuitBreakerManager:
+    def __init__(self, upstream_ids: list[str], config: CircuitBreakerConfig | None = None) -> None:
+        self._lock = threading.Lock()
+        self._config = config or CircuitBreakerConfig()
+        self._states = {upstream_id: CircuitBreakerState(upstream_id=upstream_id) for upstream_id in upstream_ids}
+
+    def sync_upstreams(self, upstream_ids: list[str]) -> None:
+        with self._lock:
+            existing = set(self._states)
+            for upstream_id in upstream_ids:
+                if upstream_id not in self._states:
+                    self._states[upstream_id] = CircuitBreakerState(upstream_id=upstream_id)
+            for upstream_id in existing - set(upstream_ids):
+                self._states.pop(upstream_id, None)
+
+    def permits_request(self, upstream_id: str) -> bool:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            state = self._states.setdefault(upstream_id, CircuitBreakerState(upstream_id=upstream_id))
+            if state.state != "open":
+                return True
+            cooldown_until = _parse_iso_datetime(state.cooldown_until)
+            return cooldown_until is None or now >= cooldown_until
+
+    def acquire(self, upstream_id: str) -> CircuitBreakerProbeLease | None:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            state = self._states.setdefault(upstream_id, CircuitBreakerState(upstream_id=upstream_id))
+            if state.state == "open":
+                cooldown_until = _parse_iso_datetime(state.cooldown_until)
+                if cooldown_until is not None and now < cooldown_until:
+                    return None
+                if state.half_open_probe_in_flight:
+                    return None
+                state.state = "half_open"
+                state.half_open_probe_in_flight = True
+                return CircuitBreakerProbeLease(manager=self, upstream_id=upstream_id, half_open=True)
+            if state.state == "half_open" and state.half_open_probe_in_flight:
+                return None
+            return CircuitBreakerProbeLease(manager=self, upstream_id=upstream_id, half_open=False)
+
+    def record_success(self, upstream_id: str, *, was_half_open: bool) -> None:
+        with self._lock:
+            state = self._states.setdefault(upstream_id, CircuitBreakerState(upstream_id=upstream_id))
+            state.consecutive_failures = 0
+            state.state = "closed"
+            state.opened_at = None
+            state.cooldown_until = None
+            state.half_open_probe_in_flight = False
+
+    def record_failure(self, upstream_id: str, *, was_half_open: bool) -> None:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            state = self._states.setdefault(upstream_id, CircuitBreakerState(upstream_id=upstream_id))
+            state.half_open_probe_in_flight = False
+            if was_half_open:
+                state.consecutive_failures = self._config.failure_threshold
+            else:
+                state.consecutive_failures += 1
+            if state.consecutive_failures >= self._config.failure_threshold:
+                state.state = "open"
+                state.opened_at = now.isoformat()
+                state.cooldown_until = (now + timedelta(seconds=max(self._config.cooldown_seconds, 1))).isoformat()
+            else:
+                state.state = "closed"
+
+    def release_probe(self, upstream_id: str, *, was_half_open: bool) -> None:
+        if not was_half_open:
+            return
+        with self._lock:
+            state = self._states.setdefault(upstream_id, CircuitBreakerState(upstream_id=upstream_id))
+            if state.state == "half_open":
+                state.half_open_probe_in_flight = False
+                state.state = "open"
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [self._states[upstream_id].as_dict() for upstream_id in sorted(self._states)]
+
+
+@dataclass
 class RelayRuntime:
     config: RelayConfig
     usage_store: UsageStore
     config_version: str
     close_usage_store_when_drained: bool
+    circuit_breaker: CircuitBreakerManager
     active_requests: int = 0
 
 
@@ -662,6 +796,9 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         for upstream in sorted(runtime.config.upstreams, key=lambda item: item.upstream_id)
                     ],
                     "order": list(runtime.config.order),
+                    "breaker": {
+                        "upstreams": runtime._runtime.circuit_breaker.snapshot(),
+                    },
                     "reload": self.runtime_manager.reload_state_snapshot(),
                 },
             )
@@ -676,7 +813,12 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_proxy(self, runtime: RuntimeLease) -> None:
         original_request_body = self._read_request_body()
-        plan = plan_request_attempts(runtime.config, self.headers, original_request_body)
+        plan = plan_request_attempts(
+            runtime.config,
+            self.headers,
+            original_request_body,
+            runtime._runtime.circuit_breaker,
+        )
         client_id = plan.client.client_id if plan.client is not None else None
         initial_upstream_id = plan.attempts[0].upstream.upstream_id if plan.attempts else None
         runtime.usage_store.request_started(client_id, initial_upstream_id, plan.requested_model)
@@ -710,6 +852,12 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
 
             last_meaningful_error: StoredUpstreamError | None = None
             for index, attempt in enumerate(plan.attempts):
+                breaker_lease = runtime._runtime.circuit_breaker.acquire(attempt.upstream.upstream_id)
+                if breaker_lease is None:
+                    if index + 1 < len(plan.attempts):
+                        continue
+                    self._send_json(503, {"error": {"message": "all upstreams temporarily unavailable"}})
+                    return
                 attempt_started_at = datetime.now(timezone.utc)
                 parsed_target = urlsplit(_build_upstream_target(attempt.upstream.base_url, self.path))
                 upstream_path = urlunsplit(("", "", parsed_target.path or "/", parsed_target.query, ""))
@@ -767,6 +915,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             completion_tokens=completion_tokens,
                             total_tokens=total_tokens,
                         )
+                        breaker_lease.mark_success()
                         return
 
                     response_headers = response.getheaders()
@@ -802,6 +951,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         total_tokens=total_tokens,
                     )
                     if can_retry:
+                        breaker_lease.mark_failure()
                         last_meaningful_error = StoredUpstreamError(
                             status_code=int(response.status),
                             reason=response.reason,
@@ -809,6 +959,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             body=captured_body,
                         )
                         continue
+                    breaker_lease.mark_failure()
                     self._relay_buffered_response(
                         int(response.status),
                         response.reason,
@@ -836,6 +987,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         completion_tokens=None,
                         total_tokens=None,
                     )
+                    breaker_lease.mark_failure()
                     if index + 1 < len(plan.attempts):
                         continue
                     if last_meaningful_error is not None:
@@ -1011,6 +1163,7 @@ class RelayService:
             usage_store=usage_store,
             config_version=_hash_config_bytes(config_bytes),
             close_usage_store_when_drained=False,
+            circuit_breaker=CircuitBreakerManager([upstream.upstream_id for upstream in config.upstreams]),
         )
         self.runtime_manager = RelayRuntimeManager(
             config_path=self.config_path,
@@ -1049,6 +1202,7 @@ class RelayService:
             usage_store=new_store,
             config_version=config_version,
             close_usage_store_when_drained=True,
+            circuit_breaker=CircuitBreakerManager([upstream.upstream_id for upstream in new_config.upstreams]),
         )
         self.runtime_manager.swap_runtime(new_runtime, close_retired_usage_store=True)
 
@@ -1066,7 +1220,9 @@ class RelayService:
             usage_store=new_store,
             config_version=config_version,
             close_usage_store_when_drained=close_retired_usage_store,
+            circuit_breaker=current_runtime.circuit_breaker,
         )
+        new_runtime.circuit_breaker.sync_upstreams([upstream.upstream_id for upstream in new_config.upstreams])
         try:
             new_listener = RelayListener(new_config, self.runtime_manager)
         except Exception:
@@ -1122,7 +1278,11 @@ class RelayService:
                         usage_store=current_runtime.usage_store,
                         config_version=signature[1],
                         close_usage_store_when_drained=False,
+                        circuit_breaker=current_runtime.circuit_breaker,
                     )
+                )
+                self.runtime_manager.active_runtime().circuit_breaker.sync_upstreams(
+                    [upstream.upstream_id for upstream in new_config.upstreams]
                 )
                 self._active_signature = signature
                 return
@@ -1131,7 +1291,12 @@ class RelayService:
             self.runtime_manager.record_reload_error(str(exc))
 
 
-def plan_request_attempts(config: RelayConfig, headers: Any, request_body: bytes) -> RequestPlan:
+def plan_request_attempts(
+    config: RelayConfig,
+    headers: Any,
+    request_body: bytes,
+    circuit_breaker: CircuitBreakerManager | None = None,
+) -> RequestPlan:
     local_key = _extract_local_key(headers)
     client = config.local_clients_by_key.get(local_key or "")
     _, requested_model = _parse_request_body(request_body)
@@ -1146,6 +1311,7 @@ def plan_request_attempts(config: RelayConfig, headers: Any, request_body: bytes
         )
 
     attempts: list[PlannedUpstreamRequest] = []
+    skipped_breaker_upstream_ids: list[str] = []
     seen_upstream_ids: set[str] = set()
     for upstream_id in config.order:
         if not upstream_id or upstream_id in seen_upstream_ids:
@@ -1154,13 +1320,35 @@ def plan_request_attempts(config: RelayConfig, headers: Any, request_body: bytes
         upstream = config.upstreams_by_id[upstream_id]
         if not upstream.enabled:
             continue
-        attempts.append(PlannedUpstreamRequest(upstream=upstream, request_body=request_body))
+        breaker_permitted = True
+        if circuit_breaker is not None and not circuit_breaker.permits_request(upstream_id):
+            skipped_breaker_upstream_ids.append(upstream_id)
+            breaker_permitted = False
+        attempts.append(
+            PlannedUpstreamRequest(
+                upstream=upstream,
+                request_body=request_body,
+                breaker_permitted=breaker_permitted,
+            )
+        )
+
+    attempts = [attempt for attempt in attempts if attempt.breaker_permitted]
 
     if attempts:
         return RequestPlan(
             client=client,
             requested_model=requested_model,
             attempts=attempts,
+        )
+
+    if skipped_breaker_upstream_ids:
+        return RequestPlan(
+            client=client,
+            requested_model=requested_model,
+            attempts=[],
+            error_status=503,
+            error_kind="all_upstreams_open",
+            error_message="all upstreams temporarily unavailable",
         )
 
     return RequestPlan(
@@ -1288,6 +1476,15 @@ def _to_local_isoformat(value: str | None) -> str | None:
     if not value:
         return None
     return datetime.fromisoformat(value).astimezone(LOCAL_TIMEZONE).isoformat(timespec="seconds")
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _extract_local_key(headers: Any) -> str | None:

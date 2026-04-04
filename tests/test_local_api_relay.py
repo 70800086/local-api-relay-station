@@ -199,6 +199,7 @@ class RelayServer:
             usage_store=self.usage_store,
             config_version=relay._hash_config_bytes(config_path.read_bytes()),
             close_usage_store_when_drained=False,
+            circuit_breaker=relay.CircuitBreakerManager([upstream.upstream_id for upstream in self.config.upstreams]),
         )
         self.runtime_manager = relay.RelayRuntimeManager(
             config_path=config_path,
@@ -286,6 +287,7 @@ class RelayRuntimeManagerTests(unittest.TestCase):
                     usage_store=store,
                     config_version=relay._hash_config_bytes(config_path.read_bytes()),
                     close_usage_store_when_drained=False,
+                    circuit_breaker=relay.CircuitBreakerManager([upstream.upstream_id for upstream in config.upstreams]),
                 )
                 manager = relay.RelayRuntimeManager(
                     config_path=config_path,
@@ -451,6 +453,26 @@ class RelayPlanningTests(unittest.TestCase):
             "https://api.example.com/primary/v1/chat/completions",
         )
 
+    def test_plan_request_attempts_skips_open_circuit_upstream(self) -> None:
+        payload = make_config_payload(listen_port=find_free_port(), database_path=":memory:")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "relay-config.json"
+            config_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            config = relay.RelayConfig.load(config_path)
+        breaker = relay.CircuitBreakerManager(["primary", "backup"])
+        breaker.record_failure("primary", was_half_open=False)
+        breaker.record_failure("primary", was_half_open=False)
+        breaker.record_failure("primary", was_half_open=False)
+
+        plan = relay.plan_request_attempts(
+            config,
+            headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
+            request_body=b'{"model":"gpt-test"}',
+            circuit_breaker=breaker,
+        )
+
+        self.assertEqual([attempt.upstream.upstream_id for attempt in plan.attempts], ["backup"])
+
     def test_usage_store_aggregates_totals_clients_upstreams_and_models(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             store = relay.UsageStore(Path(tmp_dir) / "relay.sqlite3")
@@ -555,6 +577,21 @@ class RelayServerTests(unittest.TestCase):
         self.assertTrue(health["reload"]["reload_enabled"])
         self.assertEqual(health["reload"]["config_path"], str(config_path))
         self.assertEqual(health["reload"]["draining_runtimes"], 0)
+        self.assertEqual(
+            [item["upstream_id"] for item in health["breaker"]["upstreams"]],
+            ["backup", "primary"],
+        )
+
+    def test_circuit_breaker_opens_after_repeated_failures(self) -> None:
+        breaker = relay.CircuitBreakerManager(["primary"])
+        breaker.record_failure("primary", was_half_open=False)
+        breaker.record_failure("primary", was_half_open=False)
+        breaker.record_failure("primary", was_half_open=False)
+        snapshot = breaker.snapshot()
+        self.assertEqual(snapshot[0]["upstream_id"], "primary")
+        self.assertEqual(snapshot[0]["state"], "open")
+        self.assertEqual(snapshot[0]["consecutive_failures"], 3)
+        self.assertIsNotNone(snapshot[0]["cooldown_until"])
 
 
 class RelayHotReloadTests(unittest.TestCase):
