@@ -437,7 +437,20 @@ class RelayPlanningTests(unittest.TestCase):
         )
 
 
-class RelayStoreTests(unittest.TestCase):
+    def test_build_upstream_target_does_not_duplicate_existing_base_path_prefix(self) -> None:
+        self.assertEqual(
+            relay._build_upstream_target("https://api.example.com/v1", "/chat/completions"),
+            "https://api.example.com/v1/chat/completions",
+        )
+        self.assertEqual(
+            relay._build_upstream_target("https://api.example.com/v1", "/v1/chat/completions"),
+            "https://api.example.com/v1/chat/completions",
+        )
+        self.assertEqual(
+            relay._build_upstream_target("https://api.example.com/primary", "/v1/chat/completions"),
+            "https://api.example.com/primary/v1/chat/completions",
+        )
+
     def test_usage_store_aggregates_totals_clients_upstreams_and_models(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             store = relay.UsageStore(Path(tmp_dir) / "relay.sqlite3")

@@ -1320,7 +1320,12 @@ def _build_upstream_target(upstream_base_url: str, incoming_path: str) -> str:
     parsed_incoming = urlsplit(incoming_path)
     base_path = parsed_base.path.rstrip("/")
     incoming_only_path = parsed_incoming.path or "/"
-    combined_path = f"{base_path}{incoming_only_path}" if base_path else incoming_only_path
+    if base_path and (
+        incoming_only_path == base_path or incoming_only_path.startswith(f"{base_path}/")
+    ):
+        combined_path = incoming_only_path
+    else:
+        combined_path = f"{base_path}{incoming_only_path}" if base_path else incoming_only_path
     combined_query = "&".join(part for part in [parsed_base.query, parsed_incoming.query] if part)
     target = SplitResult(
         scheme=parsed_base.scheme,
