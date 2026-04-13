@@ -122,13 +122,15 @@ proxy 请求的最小决策顺序固定如下：
 1. 用本地 key 匹配 `local.clients[].local_key`
 2. 解析 request body JSON
 3. 保留 body 里的 `model` 原样不改
-4. 按 `order` 顺序遍历 upstream id
+4. 先以 `order` 作为基础成本顺序生成候选 upstream
 5. 对每个 upstream：
    - 必须 `enabled=true`
+   - 最近失败过的 upstream 会被临时降权，恢复窗口过后自动回到基础顺序前排
+   - 已经被 breaker 打开的 upstream 会先跳过，等 cooldown 结束后再用 half-open probe 试探恢复
    - 用同一个 body 原样转发
+   - 只要该 upstream 返回错误响应或请求异常，就继续尝试下一个 upstream
    - 上游成功就立即返回
-   - 网络错误 / 超时 / 5xx / 明显不支持模型这类上游 4xx 时继续尝试下一个
-6. 全部 upstream 失败后返回最后一个有意义的错误
+6. 全部 upstream 失败后返回聚合错误，列出每个 upstream 的失败摘要
 
 不会再做的事情：
 
@@ -142,7 +144,27 @@ proxy 请求的最小决策顺序固定如下：
 - `401`：本地 key 无效
 - `400`：request body 不是合法 JSON
 - `400`：request body 缺少 `model`
-- `502/5xx`：所有 upstream 都失败
+- `502`：所有 upstream 都失败，relay 返回聚合错误
+
+## 动态优先级与恢复
+
+- `order` 仍然是默认顺序，通常表达成本优先级
+- 任何上游失败都会触发一次临时降权，避免同一个坏源持续挡在前面
+- 降权只持续一个短恢复窗口，窗口过后该 upstream 会自动回到 `order` 对应的位置，重新争取前排
+- 真正的硬故障（例如超时、连接失败、5xx、429）还会继续累加 breaker；达到阈值后暂时摘出，cooldown 结束后再 probe
+
+这样做的主要权衡：
+
+- 优点：池里只要还有活路，请求更容易被救回来；而且便宜 upstream 恢复后会自动重新抢回前排
+- 代价：恢复窗口结束后的第一批请求可能会再次探测到刚恢复不久的上游，换来一次额外 fallback
+
+## 聚合错误输出
+
+当所有 upstream 都失败时，relay 返回：
+
+- HTTP `502`
+- `error.type = "upstream_fallback_exhausted"`
+- `error.attempts[]`：按实际尝试顺序列出 `upstream_id`、`error_kind`、可用时的 `status_code` / `message`
 
 ## 启动
 

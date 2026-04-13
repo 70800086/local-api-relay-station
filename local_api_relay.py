@@ -71,11 +71,25 @@ class RequestPlan:
 
 
 @dataclass(frozen=True)
-class StoredUpstreamError:
-    status_code: int
-    reason: str
-    headers: list[tuple[str, str]]
-    body: bytes
+class UpstreamAttemptFailure:
+    upstream_id: str
+    error_kind: str
+    status_code: int | None = None
+    reason: str | None = None
+    message: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "upstream_id": self.upstream_id,
+            "error_kind": self.error_kind,
+        }
+        if self.status_code is not None:
+            payload["status_code"] = self.status_code
+        if self.reason:
+            payload["reason"] = self.reason
+        if self.message:
+            payload["message"] = self.message
+        return payload
 
 
 @dataclass(frozen=True)
@@ -455,17 +469,38 @@ class CircuitBreakerState:
     upstream_id: str
     state: str = "closed"
     consecutive_failures: int = 0
+    priority_penalty: int = 0
     opened_at: str | None = None
     cooldown_until: str | None = None
+    degraded_until: str | None = None
+    last_failure_at: str | None = None
+    last_success_at: str | None = None
     half_open_probe_in_flight: bool = False
 
-    def as_dict(self) -> dict[str, Any]:
+    def priority_tier(self, now: datetime) -> str:
+        if self.state == "open":
+            cooldown_until = _parse_iso_datetime(self.cooldown_until)
+            if cooldown_until is not None and now < cooldown_until:
+                return "open"
+        degraded_until = _parse_iso_datetime(self.degraded_until)
+        if degraded_until is not None and now < degraded_until:
+            return "degraded"
+        if self.state == "half_open":
+            return "probing"
+        return "healthy"
+
+    def as_dict(self, now: datetime) -> dict[str, Any]:
         return {
             "upstream_id": self.upstream_id,
             "state": self.state,
             "consecutive_failures": self.consecutive_failures,
+            "priority_penalty": self.priority_penalty,
+            "priority_tier": self.priority_tier(now),
             "opened_at": self.opened_at,
             "cooldown_until": self.cooldown_until,
+            "degraded_until": self.degraded_until,
+            "last_failure_at": self.last_failure_at,
+            "last_success_at": self.last_success_at,
             "half_open_probe_in_flight": self.half_open_probe_in_flight,
         }
 
@@ -474,6 +509,8 @@ class CircuitBreakerState:
 class CircuitBreakerConfig:
     failure_threshold: int = 3
     cooldown_seconds: int = 30
+    recovery_window_seconds: float = 15.0
+    max_recovery_window_seconds: float = 60.0
 
 
 @dataclass
@@ -493,6 +530,12 @@ class CircuitBreakerProbeLease:
         if self._closed:
             return
         self.manager.record_failure(self.upstream_id, was_half_open=self.half_open)
+        self._closed = True
+
+    def mark_soft_failure(self) -> None:
+        if self._closed:
+            return
+        self.manager.record_soft_failure(self.upstream_id, was_half_open=self.half_open)
         self._closed = True
 
     def close(self) -> None:
@@ -526,6 +569,23 @@ class CircuitBreakerManager:
             cooldown_until = _parse_iso_datetime(state.cooldown_until)
             return cooldown_until is None or now >= cooldown_until
 
+    def prioritized_upstream_ids(self, ordered_upstream_ids: list[str]) -> list[str]:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            seen: set[str] = set()
+            ranked: list[tuple[tuple[int, int, int], str]] = []
+            for index, upstream_id in enumerate(ordered_upstream_ids):
+                if upstream_id in seen:
+                    continue
+                seen.add(upstream_id)
+                state = self._states.setdefault(upstream_id, CircuitBreakerState(upstream_id=upstream_id))
+                tier = state.priority_tier(now)
+                tier_rank = {"healthy": 0, "probing": 0, "degraded": 1, "open": 2}.get(tier, 1)
+                penalty = state.priority_penalty if tier == "degraded" else 0
+                ranked.append(((tier_rank, penalty, index), upstream_id))
+        ranked.sort(key=lambda item: item[0])
+        return [upstream_id for _, upstream_id in ranked]
+
     def acquire(self, upstream_id: str) -> CircuitBreakerProbeLease | None:
         now = datetime.now(timezone.utc)
         with self._lock:
@@ -544,12 +604,16 @@ class CircuitBreakerManager:
             return CircuitBreakerProbeLease(manager=self, upstream_id=upstream_id, half_open=False)
 
     def record_success(self, upstream_id: str, *, was_half_open: bool) -> None:
+        now = datetime.now(timezone.utc)
         with self._lock:
             state = self._states.setdefault(upstream_id, CircuitBreakerState(upstream_id=upstream_id))
             state.consecutive_failures = 0
+            state.priority_penalty = 0
             state.state = "closed"
             state.opened_at = None
             state.cooldown_until = None
+            state.degraded_until = None
+            state.last_success_at = now.isoformat()
             state.half_open_probe_in_flight = False
 
     def record_failure(self, upstream_id: str, *, was_half_open: bool) -> None:
@@ -557,6 +621,9 @@ class CircuitBreakerManager:
         with self._lock:
             state = self._states.setdefault(upstream_id, CircuitBreakerState(upstream_id=upstream_id))
             state.half_open_probe_in_flight = False
+            state.last_failure_at = now.isoformat()
+            state.priority_penalty = self._next_priority_penalty(state, now)
+            state.degraded_until = self._priority_recovery_deadline(now, state.priority_penalty)
             if was_half_open:
                 state.consecutive_failures = self._config.failure_threshold
             else:
@@ -565,8 +632,22 @@ class CircuitBreakerManager:
                 state.state = "open"
                 state.opened_at = now.isoformat()
                 state.cooldown_until = (now + timedelta(seconds=max(self._config.cooldown_seconds, 1))).isoformat()
+                state.degraded_until = state.cooldown_until
             else:
                 state.state = "closed"
+
+    def record_soft_failure(self, upstream_id: str, *, was_half_open: bool) -> None:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            state = self._states.setdefault(upstream_id, CircuitBreakerState(upstream_id=upstream_id))
+            state.half_open_probe_in_flight = False
+            state.last_failure_at = now.isoformat()
+            state.priority_penalty = self._next_priority_penalty(state, now)
+            state.degraded_until = self._priority_recovery_deadline(now, state.priority_penalty)
+            state.consecutive_failures = 0
+            state.state = "closed"
+            state.opened_at = None
+            state.cooldown_until = None
 
     def release_probe(self, upstream_id: str, *, was_half_open: bool) -> None:
         if not was_half_open:
@@ -578,8 +659,24 @@ class CircuitBreakerManager:
                 state.state = "open"
 
     def snapshot(self) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc)
         with self._lock:
-            return [self._states[upstream_id].as_dict() for upstream_id in sorted(self._states)]
+            return [self._states[upstream_id].as_dict(now) for upstream_id in sorted(self._states)]
+
+    def _next_priority_penalty(self, state: CircuitBreakerState, now: datetime) -> int:
+        degraded_until = _parse_iso_datetime(state.degraded_until)
+        active_penalty = state.priority_penalty if degraded_until is not None and now < degraded_until else 0
+        return max(1, min(active_penalty + 1, self._config.failure_threshold))
+
+    def _priority_recovery_deadline(self, now: datetime, penalty: int) -> str | None:
+        base_window = max(float(self._config.recovery_window_seconds), 0.0)
+        if base_window <= 0:
+            return None
+        capped_seconds = min(
+            max(base_window * max(penalty, 1), base_window),
+            max(float(self._config.max_recovery_window_seconds), base_window),
+        )
+        return (now + timedelta(seconds=capped_seconds)).isoformat()
 
 
 @dataclass
@@ -850,7 +947,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            last_meaningful_error: StoredUpstreamError | None = None
+            attempt_failures: list[UpstreamAttemptFailure] = []
             for index, attempt in enumerate(plan.attempts):
                 breaker_lease = runtime._runtime.circuit_breaker.acquire(attempt.upstream.upstream_id)
                 if breaker_lease is None:
@@ -918,7 +1015,6 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         breaker_lease.mark_success()
                         return
 
-                    response_headers = response.getheaders()
                     response_bytes, captured_body = _read_full_response_body(response)
                     finished_at = datetime.now(timezone.utc)
                     prompt_tokens, completion_tokens, total_tokens = _extract_usage_metrics(
@@ -932,6 +1028,16 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         plan.requested_model,
                     )
                     can_retry = should_retry and index + 1 < len(plan.attempts)
+                    attempt_failures.append(
+                        UpstreamAttemptFailure(
+                            upstream_id=attempt.upstream.upstream_id,
+                            error_kind="upstream_status",
+                            status_code=int(response.status),
+                            reason=response.reason,
+                            message=_extract_error_message(response.getheader("Content-Type", ""), captured_body)
+                            or response.reason,
+                        )
+                    )
                     runtime.usage_store.record_request(
                         started_at=attempt_started_at,
                         finished_at=finished_at,
@@ -945,29 +1051,19 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         request_bytes=len(attempt.request_body),
                         response_bytes=response_bytes,
                         upstream_ms=_duration_ms(attempt_started_at, finished_at),
-                        error_kind="upstream_status_fallback" if can_retry else None,
+                        error_kind="upstream_status_fallback" if can_retry else "upstream_status_exhausted",
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         total_tokens=total_tokens,
                     )
-                    if can_retry:
+                    if _should_trip_circuit_breaker(int(response.status)):
                         breaker_lease.mark_failure()
-                        last_meaningful_error = StoredUpstreamError(
-                            status_code=int(response.status),
-                            reason=response.reason,
-                            headers=response_headers,
-                            body=captured_body,
-                        )
+                    else:
+                        breaker_lease.mark_soft_failure()
+                    if can_retry:
                         continue
-                    breaker_lease.mark_failure()
-                    self._relay_buffered_response(
-                        int(response.status),
-                        response.reason,
-                        response_headers,
-                        captured_body,
-                    )
-                    return
-                except (OSError, TimeoutError, http.client.HTTPException):
+                    break
+                except (OSError, TimeoutError, http.client.HTTPException) as exc:
                     finished_at = datetime.now(timezone.utc)
                     runtime.usage_store.record_request(
                         started_at=attempt_started_at,
@@ -987,30 +1083,23 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         completion_tokens=None,
                         total_tokens=None,
                     )
+                    attempt_failures.append(
+                        UpstreamAttemptFailure(
+                            upstream_id=attempt.upstream.upstream_id,
+                            error_kind="upstream_request_failed",
+                            message=str(exc) or "upstream request failed",
+                        )
+                    )
                     breaker_lease.mark_failure()
                     if index + 1 < len(plan.attempts):
                         continue
-                    if last_meaningful_error is not None:
-                        self._relay_buffered_response(
-                            last_meaningful_error.status_code,
-                            last_meaningful_error.reason,
-                            last_meaningful_error.headers,
-                            last_meaningful_error.body,
-                        )
-                        return
-                    self._send_json(502, {"error": {"message": "upstream request failed"}})
-                    return
+                    break
                 finally:
                     if connection is not None:
                         connection.close()
 
-            if last_meaningful_error is not None:
-                self._relay_buffered_response(
-                    last_meaningful_error.status_code,
-                    last_meaningful_error.reason,
-                    last_meaningful_error.headers,
-                    last_meaningful_error.body,
-                )
+            if attempt_failures:
+                self._send_exhausted_attempts(attempt_failures)
                 return
             self._send_json(502, {"error": {"message": "upstream request failed"}})
         finally:
@@ -1135,6 +1224,18 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             self.wfile.flush()
         return len(body)
+
+    def _send_exhausted_attempts(self, failures: list[UpstreamAttemptFailure]) -> int:
+        return self._send_json(
+            502,
+            {
+                "error": {
+                    "type": "upstream_fallback_exhausted",
+                    "message": "all upstream attempts failed",
+                    "attempts": [failure.as_dict() for failure in failures],
+                }
+            },
+        )
 
 
 class RelayListener:
@@ -1313,7 +1414,12 @@ def plan_request_attempts(
     attempts: list[PlannedUpstreamRequest] = []
     skipped_breaker_upstream_ids: list[str] = []
     seen_upstream_ids: set[str] = set()
-    for upstream_id in config.order:
+    ordered_upstream_ids = (
+        circuit_breaker.prioritized_upstream_ids(config.order)
+        if circuit_breaker is not None
+        else list(config.order)
+    )
+    for upstream_id in ordered_upstream_ids:
         if not upstream_id or upstream_id in seen_upstream_ids:
             continue
         seen_upstream_ids.add(upstream_id)
@@ -1367,60 +1473,12 @@ def _should_retry_with_fallback(
     response_body: bytes = b"",
     requested_model: str | None = None,
 ) -> bool:
-    if status_code >= 500:
-        return True
-    if status_code in {408, 409, 425, 429}:
-        return True
-    if status_code < 400:
-        return False
+    del content_type, response_body, requested_model
+    return status_code >= 400
 
-    message = _extract_error_message(content_type, response_body).lower()
-    requested_model_lower = (requested_model or "").strip().lower()
 
-    model_markers = (
-        "unsupported model",
-        "not supported",
-        "no such model",
-        "unknown model",
-        "model not found",
-        "does not exist",
-        "not exist",
-        "invalid model",
-        "unrecognized model",
-        "model is unavailable",
-        "model unavailable",
-        "not available",
-    )
-    model_hint = "model" in message or (requested_model_lower and requested_model_lower in message)
-    if message and model_hint and any(marker in message for marker in model_markers):
-        return True
-
-    transient_markers = (
-        "quota",
-        "credit",
-        "balance",
-        "billing",
-        "payment",
-        "expired",
-        "套餐",
-        "额度",
-        "用完",
-        "已到期",
-        "rate limit",
-        "too many requests",
-        "try again later",
-        "temporarily unavailable",
-        "temporarily overloaded",
-        "overloaded",
-        "capacity",
-        "server busy",
-        "service unavailable",
-        "engine overloaded",
-    )
-    if message and any(marker in message for marker in transient_markers):
-        return True
-
-    return False
+def _should_trip_circuit_breaker(status_code: int) -> bool:
+    return status_code >= 500 or status_code in {408, 409, 425, 429}
 
 
 def _parse_request_body(request_body: bytes) -> tuple[dict[str, Any] | None, str | None]:
