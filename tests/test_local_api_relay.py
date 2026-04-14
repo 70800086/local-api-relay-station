@@ -625,6 +625,58 @@ class RelayServerTests(unittest.TestCase):
             ["backup", "primary"],
         )
 
+    def test_build_upstream_status_view_reports_cooldown_reason_and_effective_order(self) -> None:
+        payload = make_config_payload(listen_port=find_free_port(), database_path=":memory:")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "relay-config.json"
+            config_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            config = relay.RelayConfig.load(config_path)
+
+        breaker = relay.CircuitBreakerManager(["primary", "backup"])
+        breaker.record_failure(
+            "primary",
+            was_half_open=False,
+            error_kind="upstream_status",
+            status_code=500,
+            reason="primary failure 1",
+        )
+        breaker.record_failure(
+            "primary",
+            was_half_open=False,
+            error_kind="upstream_status",
+            status_code=502,
+            reason="primary failure 2",
+        )
+        breaker.record_failure(
+            "primary",
+            was_half_open=False,
+            error_kind="upstream_request_failed",
+            reason="connect timed out",
+        )
+
+        status_view = relay.build_upstream_status_view(config, breaker)
+
+        self.assertEqual(status_view["configured_order"], ["primary", "backup"])
+        self.assertEqual(status_view["effective_order"], ["backup", "primary"])
+        upstreams = {item["upstream_id"]: item for item in status_view["upstreams"]}
+        primary = upstreams["primary"]
+        self.assertTrue(primary["enabled"])
+        self.assertEqual(primary["routing_state"], "cooldown")
+        self.assertTrue(primary["cooldown_active"])
+        self.assertFalse(primary["degraded_active"])
+        self.assertEqual(primary["priority_penalty"], 3)
+        self.assertEqual(primary["effective_index"], 1)
+        self.assertEqual(primary["recovery_at"], primary["cooldown_until"])
+        self.assertEqual(
+            primary["last_failure"],
+            {
+                "at": primary["last_failure"]["at"],
+                "error_kind": "upstream_request_failed",
+                "reason": "connect timed out",
+            },
+        )
+        self.assertIsNotNone(primary["last_failure"]["at"])
+
     def test_circuit_breaker_opens_after_repeated_failures(self) -> None:
         breaker = relay.CircuitBreakerManager(["primary"])
         breaker.record_failure("primary", was_half_open=False)
@@ -1009,6 +1061,75 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
                 idle = json.loads(idle_payload)
                 self.assertFalse(idle["idle"])
                 self.assertEqual(idle["reason"], "recent_successful_requests")
+
+    def test_health_endpoint_exposes_live_upstream_status_after_fallback_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+            relay_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                upstream_base_urls={
+                    "primary": f"http://127.0.0.1:{upstream.port}/primary",
+                    "backup": f"http://127.0.0.1:{upstream.port}/backup",
+                },
+            )
+            config_path = self.write_config(tmp_dir, payload)
+            RecordingUpstreamHandler.queue_responses(
+                {
+                    "status": 429,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "X-Upstream-Trace": "primary-rate-limit-429",
+                    },
+                    "body": b'{"error":{"message":"rate limit exceeded"}}',
+                },
+                {
+                    "status": 201,
+                    "headers": dict(DEFAULT_UPSTREAM_HEADERS),
+                    "body": DEFAULT_UPSTREAM_BODY,
+                },
+            )
+
+            with RelayServer(config_path):
+                status, _, response_body = make_request(
+                    relay_port,
+                    "POST",
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=b'{"model":"gpt-test","messages":[]}',
+                )
+                self.assertEqual(status, 201)
+                self.assertEqual(response_body, DEFAULT_UPSTREAM_BODY)
+
+                health_status, _, health_payload = make_request(
+                    relay_port,
+                    "GET",
+                    "/_relay/health",
+                    headers={"X-Relay-Admin-Key": "relay-admin"},
+                )
+                self.assertEqual(health_status, 200)
+                health = json.loads(health_payload)
+                self.assertIn("upstream_status", health)
+                self.assertEqual(health["upstream_status"]["configured_order"], ["primary", "backup"])
+                self.assertEqual(health["upstream_status"]["effective_order"], ["backup", "primary"])
+                upstreams = {item["upstream_id"]: item for item in health["upstream_status"]["upstreams"]}
+                self.assertEqual(upstreams["backup"]["effective_index"], 0)
+                self.assertEqual(upstreams["primary"]["effective_index"], 1)
+                self.assertEqual(upstreams["primary"]["routing_state"], "degraded")
+                self.assertEqual(upstreams["primary"]["priority_penalty"], 1)
+                self.assertEqual(
+                    upstreams["primary"]["last_failure"],
+                    {
+                        "at": upstreams["primary"]["last_failure"]["at"],
+                        "error_kind": "upstream_status",
+                        "status_code": 429,
+                        "reason": "rate limit exceeded",
+                    },
+                )
+                self.assertIsNotNone(upstreams["primary"]["recovery_at"])
 
     def test_non_routable_400_still_falls_back_to_backup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:

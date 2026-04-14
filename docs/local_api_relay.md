@@ -237,7 +237,36 @@ X-Relay-Admin-Key: <admin_key>
 - `local`
 - `upstreams`
 - `order`
+- `breaker`
+- `upstream_status`
 - `reload`
+
+其中：
+
+- `order` 仍是配置里的原始顺序。
+- `breaker.upstreams` 是每个 upstream 的断路器原始快照。
+- `upstream_status` 是给 operator 排障看的 live 视图，至少包含：
+  - `configured_order`
+  - `effective_order`
+  - `upstreams[]`
+
+`upstream_status.upstreams[]` 至少包含：
+
+- `upstream_id`
+- `enabled`
+- `configured_index`
+- `effective_index`
+- `breaker_state`
+- `routing_state`（`healthy` / `degraded` / `cooldown` / `probing` / `disabled`）
+- `priority_penalty`
+- `cooldown_active`
+- `degraded_active`
+- `cooldown_until`
+- `degraded_until`
+- `recovery_at`
+- `last_failure`
+
+其中 `last_failure` 会带最近一次让 upstream 进入降权/熔断路径的 `error_kind`、`status_code`（如有）、`reason` 与时间戳，便于直接确认为什么被降权、何时恢复以及当前有效排序是否符合预期。
 
 其中 `reload` 至少包含：
 

@@ -474,6 +474,9 @@ class CircuitBreakerState:
     cooldown_until: str | None = None
     degraded_until: str | None = None
     last_failure_at: str | None = None
+    last_failure_error_kind: str | None = None
+    last_failure_status_code: int | None = None
+    last_failure_reason: str | None = None
     last_success_at: str | None = None
     half_open_probe_in_flight: bool = False
 
@@ -489,6 +492,19 @@ class CircuitBreakerState:
             return "probing"
         return "healthy"
 
+    def recovery_at(self, now: datetime) -> str | None:
+        cooldown_until = _parse_iso_datetime(self.cooldown_until)
+        if cooldown_until is not None and now < cooldown_until:
+            return self.cooldown_until
+        degraded_until = _parse_iso_datetime(self.degraded_until)
+        if degraded_until is not None and now < degraded_until:
+            return self.degraded_until
+        return None
+
+    def routing_state(self, now: datetime) -> str:
+        tier = self.priority_tier(now)
+        return {"open": "cooldown"}.get(tier, tier)
+
     def as_dict(self, now: datetime) -> dict[str, Any]:
         return {
             "upstream_id": self.upstream_id,
@@ -496,10 +512,15 @@ class CircuitBreakerState:
             "consecutive_failures": self.consecutive_failures,
             "priority_penalty": self.priority_penalty,
             "priority_tier": self.priority_tier(now),
+            "routing_state": self.routing_state(now),
             "opened_at": self.opened_at,
             "cooldown_until": self.cooldown_until,
             "degraded_until": self.degraded_until,
+            "recovery_at": self.recovery_at(now),
             "last_failure_at": self.last_failure_at,
+            "last_failure_error_kind": self.last_failure_error_kind,
+            "last_failure_status_code": self.last_failure_status_code,
+            "last_failure_reason": self.last_failure_reason,
             "last_success_at": self.last_success_at,
             "half_open_probe_in_flight": self.half_open_probe_in_flight,
         }
@@ -526,16 +547,40 @@ class CircuitBreakerProbeLease:
         self.manager.record_success(self.upstream_id, was_half_open=self.half_open)
         self._closed = True
 
-    def mark_failure(self) -> None:
+    def mark_failure(
+        self,
+        *,
+        error_kind: str | None = None,
+        status_code: int | None = None,
+        reason: str | None = None,
+    ) -> None:
         if self._closed:
             return
-        self.manager.record_failure(self.upstream_id, was_half_open=self.half_open)
+        self.manager.record_failure(
+            self.upstream_id,
+            was_half_open=self.half_open,
+            error_kind=error_kind,
+            status_code=status_code,
+            reason=reason,
+        )
         self._closed = True
 
-    def mark_soft_failure(self) -> None:
+    def mark_soft_failure(
+        self,
+        *,
+        error_kind: str | None = None,
+        status_code: int | None = None,
+        reason: str | None = None,
+    ) -> None:
         if self._closed:
             return
-        self.manager.record_soft_failure(self.upstream_id, was_half_open=self.half_open)
+        self.manager.record_soft_failure(
+            self.upstream_id,
+            was_half_open=self.half_open,
+            error_kind=error_kind,
+            status_code=status_code,
+            reason=reason,
+        )
         self._closed = True
 
     def close(self) -> None:
@@ -616,12 +661,23 @@ class CircuitBreakerManager:
             state.last_success_at = now.isoformat()
             state.half_open_probe_in_flight = False
 
-    def record_failure(self, upstream_id: str, *, was_half_open: bool) -> None:
+    def record_failure(
+        self,
+        upstream_id: str,
+        *,
+        was_half_open: bool,
+        error_kind: str | None = None,
+        status_code: int | None = None,
+        reason: str | None = None,
+    ) -> None:
         now = datetime.now(timezone.utc)
         with self._lock:
             state = self._states.setdefault(upstream_id, CircuitBreakerState(upstream_id=upstream_id))
             state.half_open_probe_in_flight = False
             state.last_failure_at = now.isoformat()
+            state.last_failure_error_kind = error_kind
+            state.last_failure_status_code = status_code
+            state.last_failure_reason = reason
             state.priority_penalty = self._next_priority_penalty(state, now)
             state.degraded_until = self._priority_recovery_deadline(now, state.priority_penalty)
             if was_half_open:
@@ -636,12 +692,23 @@ class CircuitBreakerManager:
             else:
                 state.state = "closed"
 
-    def record_soft_failure(self, upstream_id: str, *, was_half_open: bool) -> None:
+    def record_soft_failure(
+        self,
+        upstream_id: str,
+        *,
+        was_half_open: bool,
+        error_kind: str | None = None,
+        status_code: int | None = None,
+        reason: str | None = None,
+    ) -> None:
         now = datetime.now(timezone.utc)
         with self._lock:
             state = self._states.setdefault(upstream_id, CircuitBreakerState(upstream_id=upstream_id))
             state.half_open_probe_in_flight = False
             state.last_failure_at = now.isoformat()
+            state.last_failure_error_kind = error_kind
+            state.last_failure_status_code = status_code
+            state.last_failure_reason = reason
             state.priority_penalty = self._next_priority_penalty(state, now)
             state.degraded_until = self._priority_recovery_deadline(now, state.priority_penalty)
             state.consecutive_failures = 0
@@ -687,6 +754,71 @@ class RelayRuntime:
     close_usage_store_when_drained: bool
     circuit_breaker: CircuitBreakerManager
     active_requests: int = 0
+
+
+def build_upstream_status_view(config: RelayConfig, circuit_breaker: CircuitBreakerManager) -> dict[str, Any]:
+    breaker_snapshot = {item["upstream_id"]: item for item in circuit_breaker.snapshot()}
+    upstreams_by_id = config.upstreams_by_id
+    configured_order = list(config.order)
+    effective_order = [
+        upstream_id
+        for upstream_id in circuit_breaker.prioritized_upstream_ids(config.order)
+        if upstreams_by_id[upstream_id].enabled
+    ]
+    configured_index = {upstream_id: index for index, upstream_id in enumerate(configured_order)}
+    effective_index = {upstream_id: index for index, upstream_id in enumerate(effective_order)}
+    upstreams: list[dict[str, Any]] = []
+    for upstream in config.upstreams:
+        breaker_state = breaker_snapshot.get(upstream.upstream_id, {})
+        last_failure: dict[str, Any] | None = None
+        if breaker_state.get("last_failure_at"):
+            last_failure = {
+                "at": breaker_state["last_failure_at"],
+                "error_kind": breaker_state.get("last_failure_error_kind"),
+                "reason": breaker_state.get("last_failure_reason"),
+            }
+            if breaker_state.get("last_failure_status_code") is not None:
+                last_failure["status_code"] = breaker_state["last_failure_status_code"]
+            last_failure = {key: value for key, value in last_failure.items() if value is not None}
+        routing_state = "disabled" if not upstream.enabled else breaker_state.get("routing_state", "healthy")
+        cooldown_active = upstream.enabled and routing_state == "cooldown"
+        degraded_active = upstream.enabled and routing_state == "degraded"
+        upstreams.append(
+            {
+                "upstream_id": upstream.upstream_id,
+                "enabled": upstream.enabled,
+                "configured_index": configured_index.get(upstream.upstream_id),
+                "effective_index": effective_index.get(upstream.upstream_id) if upstream.enabled else None,
+                "breaker_state": breaker_state.get("state", "closed"),
+                "routing_state": routing_state,
+                "consecutive_failures": breaker_state.get("consecutive_failures", 0),
+                "priority_penalty": breaker_state.get("priority_penalty", 0),
+                "cooldown_active": cooldown_active,
+                "degraded_active": degraded_active,
+                "opened_at": breaker_state.get("opened_at"),
+                "cooldown_until": breaker_state.get("cooldown_until"),
+                "degraded_until": breaker_state.get("degraded_until"),
+                "recovery_at": breaker_state.get("recovery_at"),
+                "last_failure": last_failure,
+                "last_success_at": breaker_state.get("last_success_at"),
+                "half_open_probe_in_flight": breaker_state.get("half_open_probe_in_flight", False),
+            }
+        )
+    upstreams.sort(
+        key=lambda item: (
+            0 if item["enabled"] and item["effective_index"] is not None else 1,
+            item["effective_index"]
+            if item["effective_index"] is not None
+            else (item["configured_index"] if item["configured_index"] is not None else len(configured_order)),
+            item["configured_index"] if item["configured_index"] is not None else len(configured_order),
+            item["upstream_id"],
+        )
+    )
+    return {
+        "configured_order": configured_order,
+        "effective_order": effective_order,
+        "upstreams": upstreams,
+    }
 
 
 @dataclass
@@ -896,6 +1028,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     "breaker": {
                         "upstreams": runtime._runtime.circuit_breaker.snapshot(),
                     },
+                    "upstream_status": build_upstream_status_view(runtime.config, runtime._runtime.circuit_breaker),
                     "reload": self.runtime_manager.reload_state_snapshot(),
                 },
             )
@@ -1028,14 +1161,14 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         plan.requested_model,
                     )
                     can_retry = should_retry and index + 1 < len(plan.attempts)
+                    failure_reason = _extract_error_message(response.getheader("Content-Type", ""), captured_body) or response.reason
                     attempt_failures.append(
                         UpstreamAttemptFailure(
                             upstream_id=attempt.upstream.upstream_id,
                             error_kind="upstream_status",
                             status_code=int(response.status),
                             reason=response.reason,
-                            message=_extract_error_message(response.getheader("Content-Type", ""), captured_body)
-                            or response.reason,
+                            message=failure_reason,
                         )
                     )
                     runtime.usage_store.record_request(
@@ -1057,9 +1190,17 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         total_tokens=total_tokens,
                     )
                     if _should_trip_circuit_breaker(int(response.status)):
-                        breaker_lease.mark_failure()
+                        breaker_lease.mark_failure(
+                            error_kind="upstream_status",
+                            status_code=int(response.status),
+                            reason=failure_reason,
+                        )
                     else:
-                        breaker_lease.mark_soft_failure()
+                        breaker_lease.mark_soft_failure(
+                            error_kind="upstream_status",
+                            status_code=int(response.status),
+                            reason=failure_reason,
+                        )
                     if can_retry:
                         continue
                     break
@@ -1090,7 +1231,10 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             message=str(exc) or "upstream request failed",
                         )
                     )
-                    breaker_lease.mark_failure()
+                    breaker_lease.mark_failure(
+                        error_kind="upstream_request_failed",
+                        reason=str(exc) or "upstream request failed",
+                    )
                     if index + 1 < len(plan.attempts):
                         continue
                     break
