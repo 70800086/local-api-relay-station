@@ -950,6 +950,197 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
         config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return config_path
 
+    def test_request_trace_endpoint_reconstructs_fallback_attempt_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+            relay_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                upstream_base_urls={
+                    "primary": f"http://127.0.0.1:{upstream.port}/primary",
+                    "backup": f"http://127.0.0.1:{upstream.port}/backup",
+                },
+            )
+            config_path = self.write_config(tmp_dir, payload)
+            RecordingUpstreamHandler.queue_responses(
+                {
+                    "status": 404,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "X-Upstream-Trace": "primary-no-model",
+                    },
+                    "body": b'{"error":{"message":"No such model: gpt-test"}}',
+                },
+                {
+                    "status": 201,
+                    "headers": dict(DEFAULT_UPSTREAM_HEADERS),
+                    "body": DEFAULT_UPSTREAM_BODY,
+                },
+            )
+
+            with RelayServer(config_path):
+                status, headers, response_body = make_request(
+                    relay_port,
+                    "POST",
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=b'{"model":"gpt-test","messages":[]}',
+                )
+                self.assertEqual(status, 201)
+                self.assertEqual(response_body, DEFAULT_UPSTREAM_BODY)
+                request_trace_id = headers.get("x-relay-request-trace-id")
+                self.assertTrue(request_trace_id)
+
+                trace_status, _, trace_payload = make_request(
+                    relay_port,
+                    "GET",
+                    f"/_relay/request-traces?request_trace_id={request_trace_id}",
+                    headers={"X-Relay-Admin-Key": "relay-admin"},
+                )
+                self.assertEqual(trace_status, 200)
+                trace = json.loads(trace_payload)
+
+                self.assertEqual(trace["request_trace_id"], request_trace_id)
+                self.assertEqual(trace["configured_order"], ["primary", "backup"])
+                self.assertEqual(trace["effective_order"], ["primary", "backup"])
+                self.assertEqual(trace["terminal_outcome"], "fallback_success")
+                self.assertTrue(trace["fallback_triggered"])
+                self.assertEqual(trace["planned_attempt_count"], 2)
+                self.assertEqual(trace["attempt_count"], 2)
+                self.assertTrue(trace["traversed_all_planned_attempts"])
+                self.assertEqual(trace["terminal_attempt_index"], 1)
+                self.assertEqual(trace["terminal_upstream_id"], "backup")
+                self.assertEqual(
+                    [
+                        (
+                            item["pool_index"],
+                            item["upstream_id"],
+                            item["state"],
+                            item.get("skip_reason"),
+                            item.get("attempt_index"),
+                        )
+                        for item in trace["order_pool"]
+                    ],
+                    [
+                        (0, "primary", "attempted", None, 0),
+                        (1, "backup", "attempted", None, 1),
+                    ],
+                )
+                self.assertEqual(
+                    [
+                        (
+                            item["attempt_index"],
+                            item["upstream_id"],
+                            item["status_code"],
+                            item["error_kind"],
+                            item["terminal_outcome"],
+                        )
+                        for item in trace["attempts"]
+                    ],
+                    [
+                        (0, "primary", 404, "upstream_status_fallback", "fallback_success"),
+                        (1, "backup", 201, None, "fallback_success"),
+                    ],
+                )
+
+    def test_request_trace_endpoint_marks_skipped_upstreams(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+            relay_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                upstream_base_urls={
+                    "primary": f"http://127.0.0.1:{upstream.port}/primary",
+                    "backup": f"http://127.0.0.1:{upstream.port}/backup",
+                },
+            )
+            config_path = self.write_config(tmp_dir, payload)
+            RecordingUpstreamHandler.queue_responses(
+                {
+                    "status": 201,
+                    "headers": dict(DEFAULT_UPSTREAM_HEADERS),
+                    "body": DEFAULT_UPSTREAM_BODY,
+                }
+            )
+
+            with RelayServer(config_path) as relay_server:
+                breaker = relay_server.runtime_manager.active_runtime().circuit_breaker
+                for _ in range(3):
+                    breaker.record_failure(
+                        "primary",
+                        was_half_open=False,
+                        error_kind="upstream_request_failed",
+                        reason="forced-open-for-test",
+                    )
+
+                status, headers, response_body = make_request(
+                    relay_port,
+                    "POST",
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=b'{"model":"gpt-test","messages":[]}',
+                )
+                self.assertEqual(status, 201)
+                self.assertEqual(response_body, DEFAULT_UPSTREAM_BODY)
+                request_trace_id = headers.get("x-relay-request-trace-id")
+                self.assertTrue(request_trace_id)
+
+                trace_status, _, trace_payload = make_request(
+                    relay_port,
+                    "GET",
+                    f"/_relay/request-traces?request_trace_id={request_trace_id}",
+                    headers={"X-Relay-Admin-Key": "relay-admin"},
+                )
+                self.assertEqual(trace_status, 200)
+                trace = json.loads(trace_payload)
+
+                self.assertEqual(trace["configured_order"], ["primary", "backup"])
+                self.assertEqual(trace["effective_order"], ["backup", "primary"])
+                self.assertEqual(trace["terminal_outcome"], "success")
+                self.assertFalse(trace["fallback_triggered"])
+                self.assertEqual(trace["planned_attempt_count"], 1)
+                self.assertEqual(trace["attempt_count"], 1)
+                self.assertTrue(trace["traversed_all_planned_attempts"])
+                self.assertEqual(trace["terminal_attempt_index"], 0)
+                self.assertEqual(trace["terminal_upstream_id"], "backup")
+                self.assertEqual(
+                    [
+                        (
+                            item["pool_index"],
+                            item["upstream_id"],
+                            item["state"],
+                            item.get("skip_reason"),
+                            item.get("attempt_index"),
+                        )
+                        for item in trace["order_pool"]
+                    ],
+                    [
+                        (0, "backup", "attempted", None, 0),
+                        (1, "primary", "skipped", "breaker_open", None),
+                    ],
+                )
+                self.assertEqual(
+                    [
+                        (
+                            item["attempt_index"],
+                            item["upstream_id"],
+                            item["status_code"],
+                            item["error_kind"],
+                            item["terminal_outcome"],
+                        )
+                        for item in trace["attempts"]
+                    ],
+                    [
+                        (0, "backup", 201, None, "success"),
+                    ],
+                )
+
     def test_admin_endpoints_and_fallback_flow_match_final_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
             relay_port = find_free_port()

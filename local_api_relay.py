@@ -8,12 +8,13 @@ import select
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qs, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 
@@ -68,6 +69,16 @@ class RequestPlan:
     error_status: int | None = None
     error_kind: str | None = None
     error_message: str | None = None
+    configured_order: list[str] = field(default_factory=list)
+    effective_order: list[str] = field(default_factory=list)
+    order_pool: list[dict[str, Any]] = field(default_factory=list)
+
+    def routing_snapshot(self) -> dict[str, Any]:
+        return {
+            "configured_order": list(self.configured_order),
+            "effective_order": list(self.effective_order),
+            "order_pool": [dict(item) for item in self.order_pool],
+        }
 
 
 @dataclass(frozen=True)
@@ -188,6 +199,8 @@ class UsageStore:
                     finished_at TEXT NOT NULL,
                     client_id TEXT,
                     upstream_id TEXT,
+                    request_trace_id TEXT,
+                    attempt_index INTEGER,
                     requested_model TEXT,
                     method TEXT NOT NULL,
                     path TEXT NOT NULL,
@@ -197,12 +210,15 @@ class UsageStore:
                     response_bytes INTEGER NOT NULL,
                     upstream_ms INTEGER NOT NULL,
                     error_kind TEXT,
+                    terminal_outcome TEXT,
+                    routing_snapshot_json TEXT,
                     prompt_tokens INTEGER,
                     completion_tokens INTEGER,
                     total_tokens INTEGER
                 )
                 """
             )
+            self._ensure_request_log_columns()
             self.connection.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{REQUEST_LOG_TABLE}_finished_at ON {REQUEST_LOG_TABLE}(finished_at)"
             )
@@ -215,11 +231,32 @@ class UsageStore:
             self.connection.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{REQUEST_LOG_TABLE}_model_finished_at ON {REQUEST_LOG_TABLE}(requested_model, finished_at)"
             )
+            self.connection.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{REQUEST_LOG_TABLE}_trace_attempt ON {REQUEST_LOG_TABLE}(request_trace_id, attempt_index)"
+            )
             self.connection.commit()
 
     def close(self) -> None:
         with self.lock:
             self.connection.close()
+
+    def _ensure_request_log_columns(self) -> None:
+        existing_columns = {
+            str(row["name"])
+            for row in self.connection.execute(f"PRAGMA table_info({REQUEST_LOG_TABLE})").fetchall()
+        }
+        expected_columns = {
+            "request_trace_id": "TEXT",
+            "attempt_index": "INTEGER",
+            "terminal_outcome": "TEXT",
+            "routing_snapshot_json": "TEXT",
+        }
+        for column_name, column_type in expected_columns.items():
+            if column_name in existing_columns:
+                continue
+            self.connection.execute(
+                f"ALTER TABLE {REQUEST_LOG_TABLE} ADD COLUMN {column_name} {column_type}"
+            )
 
     def request_started(
         self,
@@ -264,6 +301,10 @@ class UsageStore:
         prompt_tokens: int | None,
         completion_tokens: int | None,
         total_tokens: int | None,
+        request_trace_id: str | None = None,
+        attempt_index: int | None = None,
+        terminal_outcome: str | None = None,
+        routing_snapshot_json: str | None = None,
     ) -> None:
         with self.lock:
             self.connection.execute(
@@ -273,6 +314,8 @@ class UsageStore:
                     finished_at,
                     client_id,
                     upstream_id,
+                    request_trace_id,
+                    attempt_index,
                     requested_model,
                     method,
                     path,
@@ -282,16 +325,20 @@ class UsageStore:
                     response_bytes,
                     upstream_ms,
                     error_kind,
+                    terminal_outcome,
+                    routing_snapshot_json,
                     prompt_tokens,
                     completion_tokens,
                     total_tokens
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _serialize_datetime(started_at),
                     _serialize_datetime(finished_at),
                     client_id,
                     upstream_id,
+                    request_trace_id,
+                    attempt_index,
                     requested_model,
                     method,
                     path,
@@ -301,12 +348,164 @@ class UsageStore:
                     response_bytes,
                     upstream_ms,
                     error_kind,
+                    terminal_outcome,
+                    routing_snapshot_json,
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
                 ),
             )
             self.connection.commit()
+
+    def finalize_request_trace(self, request_trace_id: str | None, terminal_outcome: str | None) -> None:
+        if not request_trace_id or not terminal_outcome:
+            return
+        with self.lock:
+            self.connection.execute(
+                f"""
+                UPDATE {REQUEST_LOG_TABLE}
+                SET terminal_outcome = ?
+                WHERE request_trace_id = ?
+                """,
+                (terminal_outcome, request_trace_id),
+            )
+            self.connection.commit()
+
+    def request_trace(self, request_trace_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            rows = self.connection.execute(
+                f"""
+                SELECT
+                    id,
+                    started_at,
+                    finished_at,
+                    client_id,
+                    upstream_id,
+                    request_trace_id,
+                    attempt_index,
+                    requested_model,
+                    method,
+                    path,
+                    status_code,
+                    forwarded,
+                    request_bytes,
+                    response_bytes,
+                    upstream_ms,
+                    error_kind,
+                    terminal_outcome,
+                    routing_snapshot_json
+                FROM {REQUEST_LOG_TABLE}
+                WHERE request_trace_id = ?
+                ORDER BY
+                    CASE WHEN attempt_index IS NULL THEN 1 ELSE 0 END ASC,
+                    attempt_index ASC,
+                    id ASC
+                """,
+                (request_trace_id,),
+            ).fetchall()
+
+        if not rows:
+            return None
+
+        first_row = rows[0]
+        routing_snapshot = _parse_json_object(first_row["routing_snapshot_json"])
+        configured_order = _string_list(routing_snapshot.get("configured_order"))
+        effective_order = _string_list(routing_snapshot.get("effective_order"))
+        order_pool = routing_snapshot.get("order_pool")
+        if not isinstance(order_pool, list):
+            order_pool = []
+        normalized_order_pool: list[dict[str, Any]] = []
+        for item in order_pool:
+            if not isinstance(item, dict):
+                continue
+            normalized_item = {
+                "pool_index": _coerce_optional_int(item.get("pool_index")),
+                "upstream_id": str(item.get("upstream_id") or ""),
+                "state": str(item.get("state") or ""),
+            }
+            if item.get("skip_reason"):
+                normalized_item["skip_reason"] = str(item["skip_reason"])
+            if item.get("attempt_index") is not None:
+                normalized_item["attempt_index"] = _coerce_optional_int(item.get("attempt_index"))
+            normalized_order_pool.append(normalized_item)
+        normalized_order_pool.sort(
+            key=lambda item: (
+                item["pool_index"] if item["pool_index"] is not None else len(normalized_order_pool),
+                item["upstream_id"],
+            )
+        )
+
+        attempts: list[dict[str, Any]] = []
+        started_candidates: list[str] = []
+        finished_candidates: list[str] = []
+        terminal_outcome = None
+        for row in rows:
+            started_candidates.append(str(row["started_at"]))
+            finished_candidates.append(str(row["finished_at"]))
+            if row["terminal_outcome"] and terminal_outcome is None:
+                terminal_outcome = str(row["terminal_outcome"])
+        for row in rows:
+            if row["attempt_index"] is None:
+                continue
+            attempts.append(
+                {
+                    "attempt_index": int(row["attempt_index"]),
+                    "upstream_id": row["upstream_id"],
+                    "started_at": row["started_at"],
+                    "started_at_local": _to_local_isoformat(row["started_at"]),
+                    "finished_at": row["finished_at"],
+                    "finished_at_local": _to_local_isoformat(row["finished_at"]),
+                    "status_code": int(row["status_code"]),
+                    "forwarded": bool(row["forwarded"]),
+                    "request_bytes": int(row["request_bytes"]),
+                    "response_bytes": int(row["response_bytes"]),
+                    "upstream_ms": int(row["upstream_ms"]),
+                    "error_kind": row["error_kind"],
+                    "terminal_outcome": row["terminal_outcome"] or terminal_outcome,
+                }
+            )
+
+        attempts.sort(key=lambda item: item["attempt_index"])
+        planned_attempt_count = sum(1 for item in normalized_order_pool if item.get("state") == "attempted")
+        attempt_count = len(attempts)
+        terminal_row = attempts[-1] if attempts else None
+        fallback_triggered = attempt_count > 1
+        traversed_all_planned_attempts = attempt_count == planned_attempt_count
+        terminal_status_code = (
+            terminal_row["status_code"]
+            if terminal_row is not None
+            else int(first_row["status_code"])
+        )
+        terminal_error_kind = (
+            terminal_row["error_kind"]
+            if terminal_row is not None
+            else first_row["error_kind"]
+        )
+
+        return {
+            "request_trace_id": request_trace_id,
+            "client_id": first_row["client_id"],
+            "requested_model": first_row["requested_model"],
+            "method": first_row["method"],
+            "path": first_row["path"],
+            "started_at": min(started_candidates) if started_candidates else None,
+            "started_at_local": _to_local_isoformat(min(started_candidates) if started_candidates else None),
+            "finished_at": max(finished_candidates) if finished_candidates else None,
+            "finished_at_local": _to_local_isoformat(max(finished_candidates) if finished_candidates else None),
+            "configured_order": configured_order,
+            "effective_order": effective_order,
+            "order_pool": normalized_order_pool,
+            "planned_attempt_count": planned_attempt_count,
+            "attempt_count": attempt_count,
+            "fallback_triggered": fallback_triggered,
+            "traversed_all_planned_attempts": traversed_all_planned_attempts,
+            "terminal_outcome": terminal_outcome,
+            "terminal_status_code": terminal_status_code,
+            "terminal_error_kind": terminal_error_kind,
+            "terminal_attempt_index": terminal_row["attempt_index"] if terminal_row is not None else None,
+            "terminal_upstream_id": terminal_row["upstream_id"] if terminal_row is not None else None,
+            "attempts": attempts,
+        }
 
     def stats_summary(self) -> dict[str, Any]:
         with self.lock:
@@ -997,10 +1196,11 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             runtime.close()
 
     def _handle_admin(self, runtime: RuntimeLease) -> None:
+        parsed_path = urlsplit(self.path)
         if runtime.config.admin_key and self.headers.get("X-Relay-Admin-Key", "") != runtime.config.admin_key:
             self._send_json(403, {"error": {"message": "forbidden"}})
             return
-        if self.path == "/_relay/health":
+        if parsed_path.path == "/_relay/health":
             self._send_json(
                 200,
                 {
@@ -1033,15 +1233,28 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
-        if self.path == "/_relay/stats":
+        if parsed_path.path == "/_relay/stats":
             self._send_json(200, runtime.usage_store.stats_summary())
             return
-        if self.path == "/_relay/idle":
+        if parsed_path.path == "/_relay/idle":
             self._send_json(200, runtime.usage_store.idle_status(runtime.config.idle_window_seconds))
+            return
+        if parsed_path.path == "/_relay/request-traces":
+            request_trace_id = (parse_qs(parsed_path.query).get("request_trace_id") or [""])[0].strip()
+            if not request_trace_id:
+                self._send_json(400, {"error": {"message": "request_trace_id is required"}})
+                return
+            trace = runtime.usage_store.request_trace(request_trace_id)
+            if trace is None:
+                self._send_json(404, {"error": {"message": "request trace not found"}})
+                return
+            self._send_json(200, trace)
             return
         self._send_json(404, {"error": {"message": "admin endpoint not found"}})
 
     def _handle_proxy(self, runtime: RuntimeLease) -> None:
+        request_trace_id = _new_request_trace_id()
+        self._current_request_trace_id = request_trace_id
         original_request_body = self._read_request_body()
         plan = plan_request_attempts(
             runtime.config,
@@ -1049,9 +1262,13 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             original_request_body,
             runtime._runtime.circuit_breaker,
         )
+        routing_snapshot_json = _serialize_json(plan.routing_snapshot())
         client_id = plan.client.client_id if plan.client is not None else None
         initial_upstream_id = plan.attempts[0].upstream.upstream_id if plan.attempts else None
-        runtime.usage_store.request_started(client_id, initial_upstream_id, plan.requested_model)
+        track_request_state = plan.error_status is None
+        if track_request_state:
+            runtime.usage_store.request_started(client_id, initial_upstream_id, plan.requested_model)
+        terminal_outcome: str | None = None
         try:
             if plan.error_status is not None:
                 started_at = datetime.now(timezone.utc)
@@ -1065,6 +1282,8 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     finished_at=finished_at,
                     client_id=client_id,
                     upstream_id=None,
+                    request_trace_id=request_trace_id,
+                    attempt_index=None,
                     requested_model=plan.requested_model,
                     method=self.command,
                     path=self.path,
@@ -1074,19 +1293,51 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     response_bytes=response_bytes,
                     upstream_ms=_duration_ms(started_at, finished_at),
                     error_kind=plan.error_kind,
+                    terminal_outcome=plan.error_kind,
+                    routing_snapshot_json=routing_snapshot_json,
                     prompt_tokens=None,
                     completion_tokens=None,
                     total_tokens=None,
                 )
+                terminal_outcome = plan.error_kind
                 return
 
             attempt_failures: list[UpstreamAttemptFailure] = []
             for index, attempt in enumerate(plan.attempts):
+                attempt_upstream_id = attempt.upstream.upstream_id
                 breaker_lease = runtime._runtime.circuit_breaker.acquire(attempt.upstream.upstream_id)
                 if breaker_lease is None:
+                    attempt_started_at = datetime.now(timezone.utc)
+                    response_bytes = 0
+                    if index + 1 >= len(plan.attempts):
+                        response_bytes = self._send_json(503, {"error": {"message": "all upstreams temporarily unavailable"}})
+                        terminal_outcome = "all_upstreams_temporarily_unavailable"
+                    finished_at = datetime.now(timezone.utc)
+                    runtime.usage_store.record_request(
+                        started_at=attempt_started_at,
+                        finished_at=finished_at,
+                        client_id=client_id,
+                        upstream_id=attempt_upstream_id,
+                        request_trace_id=request_trace_id,
+                        attempt_index=index,
+                        requested_model=plan.requested_model,
+                        method=self.command,
+                        path=self.path,
+                        status_code=503,
+                        forwarded=False,
+                        request_bytes=len(attempt.request_body),
+                        response_bytes=response_bytes,
+                        upstream_ms=_duration_ms(attempt_started_at, finished_at),
+                        error_kind="upstream_temporarily_unavailable",
+                        terminal_outcome=terminal_outcome,
+                        routing_snapshot_json=routing_snapshot_json,
+                        prompt_tokens=None,
+                        completion_tokens=None,
+                        total_tokens=None,
+                    )
                     if index + 1 < len(plan.attempts):
                         continue
-                    self._send_json(503, {"error": {"message": "all upstreams temporarily unavailable"}})
+                    runtime.usage_store.finalize_request_trace(request_trace_id, terminal_outcome)
                     return
                 attempt_started_at = datetime.now(timezone.utc)
                 parsed_target = urlsplit(_build_upstream_target(attempt.upstream.base_url, self.path))
@@ -1123,6 +1374,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         else:
                             response_bytes, captured_body = self._relay_upstream_response(response)
                         finished_at = datetime.now(timezone.utc)
+                        terminal_outcome = "success" if index == 0 else "fallback_success"
                         prompt_tokens, completion_tokens, total_tokens = _extract_usage_metrics(
                             response.getheader("Content-Type", ""),
                             captured_body,
@@ -1132,6 +1384,8 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             finished_at=finished_at,
                             client_id=client_id,
                             upstream_id=attempt.upstream.upstream_id,
+                            request_trace_id=request_trace_id,
+                            attempt_index=index,
                             requested_model=plan.requested_model,
                             method=self.command,
                             path=self.path,
@@ -1141,11 +1395,14 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             response_bytes=response_bytes,
                             upstream_ms=_duration_ms(attempt_started_at, finished_at),
                             error_kind=None,
+                            terminal_outcome=terminal_outcome,
+                            routing_snapshot_json=routing_snapshot_json,
                             prompt_tokens=prompt_tokens,
                             completion_tokens=completion_tokens,
                             total_tokens=total_tokens,
                         )
                         breaker_lease.mark_success()
+                        runtime.usage_store.finalize_request_trace(request_trace_id, terminal_outcome)
                         return
 
                     response_bytes, captured_body = _read_full_response_body(response)
@@ -1176,6 +1433,8 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         finished_at=finished_at,
                         client_id=client_id,
                         upstream_id=attempt.upstream.upstream_id,
+                        request_trace_id=request_trace_id,
+                        attempt_index=index,
                         requested_model=plan.requested_model,
                         method=self.command,
                         path=self.path,
@@ -1185,6 +1444,8 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         response_bytes=response_bytes,
                         upstream_ms=_duration_ms(attempt_started_at, finished_at),
                         error_kind="upstream_status_fallback" if can_retry else "upstream_status_exhausted",
+                        terminal_outcome=None if can_retry else "fallback_exhausted",
+                        routing_snapshot_json=routing_snapshot_json,
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         total_tokens=total_tokens,
@@ -1211,6 +1472,8 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         finished_at=finished_at,
                         client_id=client_id,
                         upstream_id=attempt.upstream.upstream_id,
+                        request_trace_id=request_trace_id,
+                        attempt_index=index,
                         requested_model=plan.requested_model,
                         method=self.command,
                         path=self.path,
@@ -1220,6 +1483,8 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         response_bytes=0,
                         upstream_ms=_duration_ms(attempt_started_at, finished_at),
                         error_kind="upstream_request_failed",
+                        terminal_outcome=None if index + 1 < len(plan.attempts) else "fallback_exhausted",
+                        routing_snapshot_json=routing_snapshot_json,
                         prompt_tokens=None,
                         completion_tokens=None,
                         total_tokens=None,
@@ -1243,11 +1508,17 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         connection.close()
 
             if attempt_failures:
+                terminal_outcome = "fallback_exhausted"
+                runtime.usage_store.finalize_request_trace(request_trace_id, terminal_outcome)
                 self._send_exhausted_attempts(attempt_failures)
                 return
+            terminal_outcome = "upstream_request_failed"
+            runtime.usage_store.finalize_request_trace(request_trace_id, terminal_outcome)
             self._send_json(502, {"error": {"message": "upstream request failed"}})
         finally:
-            runtime.usage_store.request_finished(client_id, initial_upstream_id, plan.requested_model)
+            if track_request_state:
+                runtime.usage_store.request_finished(client_id, initial_upstream_id, plan.requested_model)
+            runtime.usage_store.finalize_request_trace(request_trace_id, terminal_outcome)
 
     def _relay_upstream_response(self, response: http.client.HTTPResponse) -> tuple[int, bytes]:
         upstream_headers = response.getheaders()
@@ -1263,6 +1534,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             if use_chunked and normalized_key == "content-length":
                 continue
             self.send_header(key, value)
+        self._send_request_trace_header()
         if use_chunked:
             self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
@@ -1299,6 +1571,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         self.send_response(response.status, response.reason)
         for key, value in upstream_headers:
             self.send_header(key, value)
+        self._send_request_trace_header()
         self.end_headers()
         self.wfile.flush()
         upstream_socket = connection.sock
@@ -1346,6 +1619,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 continue
             self.send_header(key, value)
         self.send_header("Content-Length", "0" if expects_no_body else str(len(body)))
+        self._send_request_trace_header()
         self.end_headers()
         if not expects_no_body:
             self.wfile.write(body)
@@ -1363,6 +1637,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._send_request_trace_header()
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -1380,6 +1655,11 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 }
             },
         )
+
+    def _send_request_trace_header(self) -> None:
+        request_trace_id = getattr(self, "_current_request_trace_id", None)
+        if request_trace_id:
+            self.send_header("X-Relay-Request-Trace-Id", request_trace_id)
 
 
 class RelayListener:
@@ -1545,6 +1825,12 @@ def plan_request_attempts(
     local_key = _extract_local_key(headers)
     client = config.local_clients_by_key.get(local_key or "")
     _, requested_model = _parse_request_body(request_body)
+    configured_order = list(config.order)
+    ordered_upstream_ids = (
+        circuit_breaker.prioritized_upstream_ids(config.order)
+        if circuit_breaker is not None
+        else list(config.order)
+    )
     if client is None:
         return RequestPlan(
             client=None,
@@ -1553,42 +1839,66 @@ def plan_request_attempts(
             error_status=401,
             error_kind="invalid_local_key",
             error_message="invalid local api key",
+            configured_order=configured_order,
+            effective_order=list(ordered_upstream_ids),
         )
 
     attempts: list[PlannedUpstreamRequest] = []
+    order_pool: list[dict[str, Any]] = []
     skipped_breaker_upstream_ids: list[str] = []
     seen_upstream_ids: set[str] = set()
-    ordered_upstream_ids = (
-        circuit_breaker.prioritized_upstream_ids(config.order)
-        if circuit_breaker is not None
-        else list(config.order)
-    )
-    for upstream_id in ordered_upstream_ids:
+    effective_order: list[str] = []
+    for pool_index, upstream_id in enumerate(ordered_upstream_ids):
         if not upstream_id or upstream_id in seen_upstream_ids:
             continue
         seen_upstream_ids.add(upstream_id)
+        effective_order.append(upstream_id)
         upstream = config.upstreams_by_id[upstream_id]
         if not upstream.enabled:
+            order_pool.append(
+                {
+                    "pool_index": pool_index,
+                    "upstream_id": upstream_id,
+                    "state": "skipped",
+                    "skip_reason": "disabled",
+                }
+            )
             continue
-        breaker_permitted = True
         if circuit_breaker is not None and not circuit_breaker.permits_request(upstream_id):
             skipped_breaker_upstream_ids.append(upstream_id)
-            breaker_permitted = False
+            order_pool.append(
+                {
+                    "pool_index": pool_index,
+                    "upstream_id": upstream_id,
+                    "state": "skipped",
+                    "skip_reason": "breaker_open",
+                }
+            )
+            continue
+        attempt_index = len(attempts)
         attempts.append(
             PlannedUpstreamRequest(
                 upstream=upstream,
                 request_body=request_body,
-                breaker_permitted=breaker_permitted,
             )
         )
-
-    attempts = [attempt for attempt in attempts if attempt.breaker_permitted]
+        order_pool.append(
+            {
+                "pool_index": pool_index,
+                "upstream_id": upstream_id,
+                "state": "attempted",
+                "attempt_index": attempt_index,
+            }
+        )
 
     if attempts:
         return RequestPlan(
             client=client,
             requested_model=requested_model,
             attempts=attempts,
+            configured_order=configured_order,
+            effective_order=effective_order,
+            order_pool=order_pool,
         )
 
     if skipped_breaker_upstream_ids:
@@ -1599,6 +1909,9 @@ def plan_request_attempts(
             error_status=503,
             error_kind="all_upstreams_open",
             error_message="all upstreams temporarily unavailable",
+            configured_order=configured_order,
+            effective_order=effective_order,
+            order_pool=order_pool,
         )
 
     return RequestPlan(
@@ -1608,6 +1921,9 @@ def plan_request_attempts(
         error_status=502,
         error_kind="no_enabled_upstreams",
         error_message="no enabled upstreams configured",
+        configured_order=configured_order,
+        effective_order=effective_order,
+        order_pool=order_pool,
     )
 
 
@@ -1664,6 +1980,32 @@ def _extract_error_message(content_type: str, body: bytes) -> str:
         if isinstance(message, str):
             return message
     return text
+
+
+def _new_request_trace_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _serialize_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _parse_json_object(value: Any) -> dict[str, Any]:
+    if not value or not isinstance(value, str):
+        return {}
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, str)]
 
 
 def _duration_ms(started_at: datetime, finished_at: datetime) -> int:

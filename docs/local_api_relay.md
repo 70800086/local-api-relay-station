@@ -166,6 +166,20 @@ proxy 请求的最小决策顺序固定如下：
 - `error.type = "upstream_fallback_exhausted"`
 - `error.attempts[]`：按实际尝试顺序列出 `upstream_id`、`error_kind`、可用时的 `status_code` / `message`
 
+## 单请求 fallback trace
+
+每次代理请求都会返回一个响应头：
+
+- `X-Relay-Request-Trace-Id`
+
+这个 trace id 会同时写进 `request_log_v4`，并附带最小排障字段：
+
+- `request_trace_id`
+- `attempt_index`
+- `terminal_outcome`
+
+同一次原始请求的所有 attempt 会共享同一个 `request_trace_id`，所以 operator 可以按一次请求稳定还原完整 attempt 链，而不是只能看散落的原始日志行。
+
 ## 启动
 
 ```bash
@@ -290,6 +304,30 @@ X-Relay-Admin-Key: <admin_key>
 - `models`
 
 其中 `models` 统计的是请求体里原始传入的 model id，而不是 relay 改写后的模型名。
+
+### `/_relay/request-traces?request_trace_id=<trace_id>`
+
+按单请求返回 fallback trace，至少包含：
+
+- `request_trace_id`
+- `configured_order`
+- `effective_order`
+- `order_pool[]`
+- `planned_attempt_count`
+- `attempt_count`
+- `fallback_triggered`
+- `traversed_all_planned_attempts`
+- `terminal_outcome`
+- `terminal_attempt_index`
+- `terminal_upstream_id`
+- `attempts[]`
+
+其中：
+
+- `order_pool[]` 会标出这次请求在当时的 effective order 里，哪些 upstream 被 `attempted`、哪些被 `skipped`
+- `order_pool[].skip_reason` 目前最少会区分 `disabled` 和 `breaker_open`
+- `traversed_all_planned_attempts=true` 表示这次请求已经把当时所有可尝试 upstream 都走完了；如果同时 `terminal_outcome=fallback_success`，说明它是在最后一跳才救回来
+- `attempts[]` 按 `attempt_index` 顺序列出每一跳的 `upstream_id`、`status_code`、`error_kind`、`upstream_ms` 和该请求的最终 `terminal_outcome`
 
 ### `/_relay/idle`
 
