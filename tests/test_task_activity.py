@@ -1,8 +1,14 @@
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from zoneinfo import ZoneInfo
 
-from task_activity import assess_task_activity, relay_client_activity_from_stats_payload
+from task_activity import (
+    assess_task_activity,
+    relay_client_activity_from_stats_payload,
+    resolve_local_relay_config_path,
+)
 from task_watchdog import TaskRecord
 
 
@@ -29,6 +35,29 @@ def make_task(
 
 
 class TaskActivityTests(unittest.TestCase):
+    def test_resolve_local_relay_config_path_prefers_relay_subdir_file(self) -> None:
+        with TemporaryDirectory() as workspace_root:
+            root = Path(workspace_root)
+            legacy_path = root / "local_api_relay.json"
+            relay_path = root / "relay" / "local_api_relay.json"
+            relay_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_path.write_text("{}", encoding="utf-8")
+            relay_path.write_text("{}", encoding="utf-8")
+
+            resolved = resolve_local_relay_config_path(root)
+
+            self.assertEqual(resolved, relay_path)
+
+    def test_resolve_local_relay_config_path_falls_back_to_legacy_root_file(self) -> None:
+        with TemporaryDirectory() as workspace_root:
+            root = Path(workspace_root)
+            legacy_path = root / "local_api_relay.json"
+            legacy_path.write_text("{}", encoding="utf-8")
+
+            resolved = resolve_local_relay_config_path(root)
+
+            self.assertEqual(resolved, legacy_path)
+
     def test_assess_task_activity_detects_task_board_only_activity(self) -> None:
         assessment = assess_task_activity(
             make_task(

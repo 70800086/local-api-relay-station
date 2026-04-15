@@ -134,11 +134,14 @@ def relay_client_activity_from_stats_payload(
 
 
 def load_local_relay_activity(
-    config_path: str | Path = Path("local_api_relay.json"),
+    config_path: str | Path | None = None,
     *,
     client_id: str = "openclaw",
     timeout_seconds: float = 1.5,
 ) -> RelayClientActivity | None:
+    if config_path is None:
+        config_path = resolve_local_relay_config_path()
+
     config = _read_relay_config(config_path)
     if config is None:
         return None
@@ -164,6 +167,17 @@ def load_local_relay_activity(
         client_id=client_id,
         timeout_seconds=timeout_seconds,
     )
+
+
+def resolve_local_relay_config_path(workspace_root: str | Path | None = None) -> Path:
+    root = Path(workspace_root) if workspace_root is not None else Path(__file__).resolve().parent
+    relay_subdir_candidate = root / "relay" / "local_api_relay.json"
+    legacy_root_candidate = root / "local_api_relay.json"
+    if relay_subdir_candidate.exists():
+        return relay_subdir_candidate
+    if legacy_root_candidate.exists():
+        return legacy_root_candidate
+    return relay_subdir_candidate
 
 
 def fetch_relay_client_activity(
