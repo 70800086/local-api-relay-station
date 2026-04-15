@@ -139,6 +139,8 @@ class RecordingUpstreamHandler(BaseHTTPRequestHandler):
     requests: list[dict[str, object]] = []
     response_plan: list[dict[str, object]] = []
     response_plan_lock = threading.Lock()
+    release_response = threading.Event()
+    response_started = threading.Event()
 
     def do_POST(self) -> None:
         self._record_and_reply()
@@ -153,6 +155,8 @@ class RecordingUpstreamHandler(BaseHTTPRequestHandler):
     def reset(cls) -> None:
         cls.requests = []
         cls.response_plan = []
+        cls.release_response = threading.Event()
+        cls.response_started = threading.Event()
 
     @classmethod
     def queue_responses(cls, *responses: dict[str, object]) -> None:
@@ -180,6 +184,13 @@ class RecordingUpstreamHandler(BaseHTTPRequestHandler):
                 response_status = int(response_plan_item.get("status", response_status))
                 response_headers = dict(response_plan_item.get("headers", response_headers))
                 response_body = response_plan_item.get("body", response_body)
+                wait_for_release = bool(response_plan_item.get("wait_for_release", False))
+            else:
+                wait_for_release = False
+
+        if wait_for_release:
+            self.__class__.response_started.set()
+            self.__class__.release_response.wait(timeout=5)
 
         self.send_response(response_status)
         for key, value in response_headers.items():
@@ -985,6 +996,102 @@ class RelayHotReloadTests(unittest.TestCase):
                     wait_for(failed)
             finally:
                 blocker.close()
+
+    def test_shutdown_waits_for_in_flight_request_before_closing_active_usage_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+            port = find_free_port()
+            config_path = Path(tmp_dir) / "relay-config.json"
+            payload = make_config_payload(
+                listen_port=port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                upstream_base_urls={
+                    "primary": f"http://127.0.0.1:{upstream.port}/v1",
+                    "backup": f"http://127.0.0.1:{upstream.port}/v1",
+                },
+            )
+            self.write_config(config_path, payload)
+            service = relay.RelayService(config_path, reload_poll_interval_seconds=0.05)
+            service_thread = threading.Thread(target=service.serve_forever, daemon=True)
+            service_thread.start()
+            original_server_close = service.listener.server.server_close
+            original_server_shutdown = service.listener.server.shutdown
+            try:
+                wait_for(
+                    lambda: make_request(
+                        port,
+                        "GET",
+                        "/_relay/health",
+                        headers={"X-Relay-Admin-Key": payload["server"]["admin_key"]},
+                    )[0]
+                    == 200
+                )
+
+                active_store = service.runtime_manager.active_runtime().usage_store
+                store_closed = threading.Event()
+                original_close = active_store.close
+
+                def tracked_close() -> None:
+                    store_closed.set()
+                    original_close()
+
+                active_store.close = tracked_close  # type: ignore[method-assign]
+                server_shutdown_completed = threading.Event()
+
+                def tracked_server_shutdown() -> None:
+                    original_server_shutdown()
+                    server_shutdown_completed.set()
+
+                service.listener.server.shutdown = tracked_server_shutdown  # type: ignore[method-assign]
+                service.listener.server.server_close = lambda: None  # type: ignore[method-assign]
+
+                RecordingUpstreamHandler.queue_responses({"status": 201, "wait_for_release": True})
+                request_result: dict[str, tuple[int, dict[str, str], bytes]] = {}
+
+                def perform_request() -> None:
+                    request_result["response"] = make_request(
+                        port,
+                        "POST",
+                        "/v1/chat/completions",
+                        headers={
+                            "Authorization": "Bearer local-chat-key",
+                            "Content-Type": "application/json",
+                        },
+                        body=b'{"model":"gpt-test","messages":[]}',
+                    )
+
+                request_thread = threading.Thread(target=perform_request, daemon=True)
+                request_thread.start()
+                wait_for(lambda: RecordingUpstreamHandler.response_started.is_set())
+
+                service.shutdown()
+                wait_for(lambda: server_shutdown_completed.is_set())
+                time.sleep(0.05)
+                self.assertFalse(
+                    store_closed.is_set(),
+                    "shutdown closed the active usage store before the in-flight request finished",
+                )
+                self.assertTrue(
+                    request_thread.is_alive(),
+                    "request unexpectedly finished before the upstream gate was released",
+                )
+
+                RecordingUpstreamHandler.release_response.set()
+                request_thread.join(timeout=2)
+                self.assertFalse(request_thread.is_alive(), "in-flight request did not complete after release")
+                service_thread.join(timeout=2)
+                self.assertFalse(service_thread.is_alive(), "relay service did not stop after request drain")
+                self.assertTrue(store_closed.is_set(), "active usage store was never closed during shutdown")
+
+                status, _, body = request_result["response"]
+                self.assertEqual(status, 201)
+                self.assertEqual(body, DEFAULT_UPSTREAM_BODY)
+            finally:
+                RecordingUpstreamHandler.release_response.set()
+                service.listener.server.shutdown = original_server_shutdown  # type: ignore[method-assign]
+                service.listener.server.server_close = original_server_close  # type: ignore[method-assign]
+                service.shutdown()
+                service_thread.join(timeout=2)
+                original_server_close()
 
 
 class LocalApiRelayIntegrationTests(unittest.TestCase):

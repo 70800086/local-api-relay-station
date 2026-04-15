@@ -1121,6 +1121,13 @@ class RelayRuntimeManager:
         with self._lock:
             return self._active_runtime
 
+    def wait_for_runtime_drained(self, runtime: RelayRuntime, poll_interval_seconds: float = 0.01) -> None:
+        while True:
+            with self._lock:
+                if runtime.active_requests == 0:
+                    return
+            time.sleep(poll_interval_seconds)
+
     def swap_runtime(self, runtime: RelayRuntime, *, close_retired_usage_store: bool = False) -> None:
         stores_to_close: list[UsageStore] = []
         with self._lock:
@@ -1719,7 +1726,9 @@ class RelayService:
                 pass
         finally:
             self.listener.stop()
-            self.runtime_manager.active_runtime().usage_store.close()
+            active_runtime = self.runtime_manager.active_runtime()
+            self.runtime_manager.wait_for_runtime_drained(active_runtime)
+            active_runtime.usage_store.close()
 
     def shutdown(self) -> None:
         self._stop_event.set()
