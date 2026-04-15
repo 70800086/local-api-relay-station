@@ -686,6 +686,85 @@ class UsageStore:
             pricing=config.pricing if config is not None else None,
         )
 
+    def upstream_costs_by_time_range(
+        self,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+        config: RelayConfig | None = None,
+    ) -> dict[str, Any]:
+        start_at_utc = _require_timezone_datetime(start_at, label="start")
+        end_at_utc = _require_timezone_datetime(end_at, label="end")
+        if start_at_utc >= end_at_utc:
+            raise ValueError("start must be before end")
+
+        params = (
+            _serialize_datetime(start_at_utc),
+            _serialize_datetime(end_at_utc),
+        )
+        where_clause = "upstream_id IS NOT NULL AND finished_at >= ? AND finished_at < ?"
+        with self.lock:
+            totals_row = self.connection.execute(
+                _summary_query(where_clause=where_clause),
+                params,
+            ).fetchone()
+            totals_status_rows = self.connection.execute(
+                f"""
+                SELECT status_code, COUNT(*) AS count
+                FROM {REQUEST_LOG_TABLE}
+                WHERE {where_clause}
+                GROUP BY status_code
+                ORDER BY status_code ASC
+                """,
+                params,
+            ).fetchall()
+            upstream_rows = self.connection.execute(
+                _dimension_summary_query("upstream_id", where_clause, "upstream_id"),
+                params,
+            ).fetchall()
+            upstream_status_rows = self.connection.execute(
+                _dimension_status_query("upstream_id", where_clause, "upstream_id"),
+                params,
+            ).fetchall()
+            usage_rows = self.connection.execute(
+                f"""
+                SELECT
+                    client_id,
+                    upstream_id,
+                    requested_model,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens
+                FROM {REQUEST_LOG_TABLE}
+                WHERE {where_clause}
+                """,
+                params,
+            ).fetchall()
+
+        payload = {
+            "time_range": _time_range_payload(
+                field="finished_at",
+                start_at=start_at_utc,
+                end_at=end_at_utc,
+            ),
+            "totals": _build_summary_payload(
+                totals_row,
+                status_codes=_status_code_counts(totals_status_rows),
+                in_flight_requests=0,
+            ),
+            "upstreams": _build_dimension_summaries(
+                rows=upstream_rows,
+                status_rows=upstream_status_rows,
+                label_key="upstream_id",
+                active_counts={},
+            ),
+        }
+        return _augment_stats_payload(
+            payload,
+            usage_rows=usage_rows,
+            pricing=config.pricing if config is not None else None,
+        )
+
     def idle_status(self, window_seconds: int) -> dict[str, Any]:
         cutoff = _serialize_datetime(datetime.fromtimestamp(time.time() - window_seconds, tz=timezone.utc))
         with self.lock:
@@ -1352,6 +1431,32 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed_path.path == "/_relay/stats":
             self._send_json(200, runtime.usage_store.stats_summary(config=runtime.config))
+            return
+        if parsed_path.path == "/_relay/upstream-costs":
+            query = parse_qs(parsed_path.query)
+            start_raw = (query.get("start") or [""])[0].strip()
+            end_raw = (query.get("end") or [""])[0].strip()
+            if not start_raw or not end_raw:
+                self._send_json(400, {"error": {"message": "start and end are required"}})
+                return
+            start_at, start_error = _parse_admin_query_datetime(start_raw, param_name="start")
+            if start_error:
+                self._send_json(400, {"error": {"message": start_error}})
+                return
+            end_at, end_error = _parse_admin_query_datetime(end_raw, param_name="end")
+            if end_error:
+                self._send_json(400, {"error": {"message": end_error}})
+                return
+            try:
+                payload = runtime.usage_store.upstream_costs_by_time_range(
+                    start_at=start_at,
+                    end_at=end_at,
+                    config=runtime.config,
+                )
+            except ValueError as exc:
+                self._send_json(400, {"error": {"message": str(exc)}})
+                return
+            self._send_json(200, payload)
             return
         if parsed_path.path == "/_relay/idle":
             self._send_json(200, runtime.usage_store.idle_status(runtime.config.idle_window_seconds))
@@ -2155,6 +2260,36 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
         return None
 
 
+def _require_timezone_datetime(value: datetime, *, label: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{label} must include timezone offset")
+    return value.astimezone(timezone.utc)
+
+
+def _parse_admin_query_datetime(value: str | None, *, param_name: str) -> tuple[datetime | None, str | None]:
+    parsed = _parse_iso_datetime(value)
+    if parsed is None:
+        return None, f"{param_name} must be an ISO8601 datetime"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None, f"{param_name} must include timezone offset"
+    return parsed.astimezone(timezone.utc), None
+
+
+def _time_range_payload(*, field: str, start_at: datetime, end_at: datetime) -> dict[str, Any]:
+    start_at_utc = _require_timezone_datetime(start_at, label="start")
+    end_at_utc = _require_timezone_datetime(end_at, label="end")
+    start_value = _serialize_datetime(start_at_utc)
+    end_value = _serialize_datetime(end_at_utc)
+    return {
+        "field": field,
+        "start": start_value,
+        "start_local": _to_local_isoformat(start_value),
+        "end": end_value,
+        "end_local": _to_local_isoformat(end_value),
+        "interval": "[start, end)",
+    }
+
+
 def _extract_local_key(headers: Any) -> str | None:
     authorization = headers.get("Authorization")
     if authorization and authorization.lower().startswith("bearer "):
@@ -2315,7 +2450,8 @@ def _status_code_counts(rows: list[sqlite3.Row]) -> dict[str, int]:
     return {str(int(row["status_code"])): int(row["count"]) for row in rows}
 
 
-def _summary_query() -> str:
+def _summary_query(where_clause: str | None = None) -> str:
+    where_sql = f"\n        WHERE {where_clause}" if where_clause else ""
     return f"""
         SELECT
             COUNT(*) AS requests,
@@ -2333,6 +2469,7 @@ def _summary_query() -> str:
             MAX(finished_at) AS last_request_at,
             MAX(CASE WHEN status_code BETWEEN 200 AND 299 THEN finished_at END) AS last_success_at
         FROM {REQUEST_LOG_TABLE}
+        {where_sql}
     """
 
 

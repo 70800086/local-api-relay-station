@@ -6,7 +6,7 @@ import socket
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
@@ -170,6 +170,178 @@ class HttpServerHarness:
 
 
 class RelayOperatorTests(unittest.TestCase):
+    def test_usage_store_summarizes_upstream_costs_within_time_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = write_config(
+                Path(tmp_dir) / "relay-config.json",
+                upstreams={
+                    "primary": {
+                        "base_url": "https://primary.example.com/v1",
+                        "api_key": "primary-key",
+                        "enabled": True,
+                        "transport": {"timeout_seconds": 120},
+                    },
+                    "backup": {
+                        "base_url": "https://backup.example.com/v1",
+                        "api_key": "backup-key",
+                        "enabled": True,
+                        "transport": {"timeout_seconds": 120},
+                    },
+                },
+                order=["primary", "backup"],
+                pricing={
+                    "currency": "USD",
+                    "upstreams": {
+                        "primary": {
+                            "input_per_million_tokens": 1.0,
+                            "output_per_million_tokens": 2.0,
+                        },
+                        "backup": {
+                            "input_per_million_tokens": 0.5,
+                            "output_per_million_tokens": 1.5,
+                        },
+                    },
+                },
+            )
+            config = relay.RelayConfig.load(config_path)
+            store = relay.UsageStore(Path(tmp_dir) / "relay.sqlite3")
+            try:
+                window_start = datetime(2026, 4, 15, 0, 0, tzinfo=timezone.utc)
+                window_end = window_start + timedelta(hours=1)
+                store.record_request(
+                    started_at=window_start,
+                    finished_at=window_start + timedelta(minutes=10),
+                    client_id="chat-client",
+                    upstream_id="primary",
+                    requested_model="gpt-test",
+                    method="POST",
+                    path="/v1/chat/completions",
+                    status_code=200,
+                    forwarded=True,
+                    request_bytes=120,
+                    response_bytes=240,
+                    upstream_ms=15,
+                    error_kind=None,
+                    prompt_tokens=1000,
+                    completion_tokens=500,
+                    total_tokens=1500,
+                )
+                store.record_request(
+                    started_at=window_start,
+                    finished_at=window_start + timedelta(minutes=20),
+                    client_id="chat-client",
+                    upstream_id="primary",
+                    requested_model="gpt-test",
+                    method="POST",
+                    path="/v1/chat/completions",
+                    status_code=502,
+                    forwarded=True,
+                    request_bytes=120,
+                    response_bytes=240,
+                    upstream_ms=17,
+                    error_kind="upstream_status_fallback",
+                    prompt_tokens=200,
+                    completion_tokens=100,
+                    total_tokens=300,
+                )
+                store.record_request(
+                    started_at=window_start,
+                    finished_at=window_start + timedelta(minutes=40),
+                    client_id="chat-client",
+                    upstream_id="backup",
+                    requested_model="gpt-test",
+                    method="POST",
+                    path="/v1/chat/completions",
+                    status_code=201,
+                    forwarded=True,
+                    request_bytes=120,
+                    response_bytes=240,
+                    upstream_ms=19,
+                    error_kind=None,
+                    prompt_tokens=800,
+                    completion_tokens=400,
+                    total_tokens=1200,
+                )
+                store.record_request(
+                    started_at=window_start,
+                    finished_at=window_end,
+                    client_id="chat-client",
+                    upstream_id="backup",
+                    requested_model="gpt-test",
+                    method="POST",
+                    path="/v1/chat/completions",
+                    status_code=200,
+                    forwarded=True,
+                    request_bytes=120,
+                    response_bytes=240,
+                    upstream_ms=21,
+                    error_kind=None,
+                    prompt_tokens=999,
+                    completion_tokens=999,
+                    total_tokens=1998,
+                )
+
+                summary = store.upstream_costs_by_time_range(
+                    start_at=window_start,
+                    end_at=window_end,
+                    config=config,
+                )
+            finally:
+                store.close()
+
+        self.assertEqual(
+            summary["time_range"],
+            {
+                "field": "finished_at",
+                "start": "2026-04-15T00:00:00+00:00",
+                "start_local": "2026-04-15T08:00:00+08:00",
+                "end": "2026-04-15T01:00:00+00:00",
+                "end_local": "2026-04-15T09:00:00+08:00",
+                "interval": "[start, end)",
+            },
+        )
+        self.assertEqual(summary["totals"]["requests"], 3)
+        self.assertEqual(summary["totals"]["successes"], 2)
+        self.assertEqual(summary["totals"]["failures"], 1)
+        self.assertEqual(
+            summary["totals"]["usage"]["estimated_cost"],
+            {
+                "currency": "USD",
+                "estimated_requests": 3,
+                "input": 0.0016,
+                "output": 0.0018,
+                "total": 0.0034,
+            },
+        )
+        upstreams = {item["upstream_id"]: item for item in summary["upstreams"]}
+        self.assertEqual(
+            upstreams["primary"]["usage"]["estimated_cost"],
+            {
+                "currency": "USD",
+                "estimated_requests": 2,
+                "input": 0.0012,
+                "output": 0.0012,
+                "total": 0.0024,
+            },
+        )
+        self.assertEqual(upstreams["primary"]["requests"], 2)
+        self.assertEqual(upstreams["primary"]["successes"], 1)
+        self.assertEqual(upstreams["primary"]["failures"], 1)
+        self.assertEqual(upstreams["primary"]["usage"]["prompt_tokens"], 1200)
+        self.assertEqual(
+            upstreams["backup"]["usage"]["estimated_cost"],
+            {
+                "currency": "USD",
+                "estimated_requests": 1,
+                "input": 0.0004,
+                "output": 0.0006,
+                "total": 0.001,
+            },
+        )
+        self.assertEqual(upstreams["backup"]["requests"], 1)
+        self.assertEqual(upstreams["backup"]["successes"], 1)
+        self.assertEqual(upstreams["backup"]["failures"], 0)
+
     def test_stats_summary_includes_estimated_cost_usage_policy_and_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = write_config(

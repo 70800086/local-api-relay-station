@@ -359,6 +359,50 @@ X-Relay-Admin-Key: <admin_key>
 - `usage_policy` 会明确说明 token / estimated cost 的来源和缺失场景
 - `usage_coverage` 会明确当前 stats 口径里，多少请求具备 prompt/completion/total token，多少请求真正进入了 estimated cost
 
+### `/_relay/upstream-costs?start=<iso8601>&end=<iso8601>`
+
+按时间范围聚合各 upstream 的请求量与费用汇总，适合直接看某个时间段内每个源的 usage / estimated cost。
+
+参数要求：
+
+- `start`、`end` 都必填
+- 必须是带时区偏移的 ISO8601 时间，例如 `2026-04-15T00:00:00+08:00`
+- 当前窗口口径固定使用 `request_log_v4.finished_at`
+- 区间语义是 `[start, end)`，也就是包含 `start`，不包含 `end`
+
+request log 当前与该接口直接相关的字段至少有：
+
+- `started_at`
+- `finished_at`
+- `upstream_id`
+- `prompt_tokens`
+- `completion_tokens`
+- `total_tokens`
+- `cached_tokens`
+
+至少返回：
+
+- `time_range`
+- `totals`
+- `upstreams`
+- `usage_policy`
+- `usage_coverage`
+
+其中：
+
+- `time_range.field` 当前固定为 `finished_at`
+- `totals` 是整个时间窗口里所有 upstream 请求的聚合
+- `upstreams[]` 每项至少包含 `upstream_id`、`requests`、`successes`、`failures`、`status_codes`、`usage`
+- `usage.estimated_cost` 与 `/_relay/stats` 复用同一套 `pricing` 推导逻辑
+
+示例：
+
+```bash
+curl -s \
+  -H 'X-Relay-Admin-Key: relay-admin' \
+  'http://127.0.0.1:8787/_relay/upstream-costs?start=2026-04-15T00:00:00%2B08:00&end=2026-04-16T00:00:00%2B08:00'
+```
+
 ### `/_relay/request-traces?request_trace_id=<trace_id>`
 
 按单请求返回 fallback trace，至少包含：

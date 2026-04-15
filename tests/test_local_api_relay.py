@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -651,6 +651,136 @@ class RelayPlanningTests(unittest.TestCase):
 
 
 class RelayServerTests(unittest.TestCase):
+    def test_upstream_costs_endpoint_returns_windowed_usage_and_cost_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            relay_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            payload["pricing"] = {
+                "currency": "USD",
+                "upstreams": {
+                    "primary": {
+                        "input_per_million_tokens": 1.0,
+                        "output_per_million_tokens": 2.0,
+                    },
+                    "backup": {
+                        "input_per_million_tokens": 0.5,
+                        "output_per_million_tokens": 1.5,
+                    },
+                },
+            }
+            config_path = Path(tmp_dir) / "relay-config.json"
+            config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            seeded_store = relay.UsageStore(Path(tmp_dir) / "relay.sqlite3")
+            try:
+                window_start = datetime(2026, 4, 15, 0, 0, tzinfo=timezone.utc)
+                window_end = window_start + timedelta(hours=1)
+                seeded_store.record_request(
+                    started_at=window_start,
+                    finished_at=window_start + timedelta(minutes=10),
+                    client_id="chat-client",
+                    upstream_id="primary",
+                    requested_model="gpt-test",
+                    method="POST",
+                    path="/v1/chat/completions",
+                    status_code=200,
+                    forwarded=True,
+                    request_bytes=120,
+                    response_bytes=240,
+                    upstream_ms=15,
+                    error_kind=None,
+                    prompt_tokens=1000,
+                    completion_tokens=500,
+                    total_tokens=1500,
+                )
+                seeded_store.record_request(
+                    started_at=window_start,
+                    finished_at=window_start + timedelta(minutes=20),
+                    client_id="chat-client",
+                    upstream_id="primary",
+                    requested_model="gpt-test",
+                    method="POST",
+                    path="/v1/chat/completions",
+                    status_code=502,
+                    forwarded=True,
+                    request_bytes=120,
+                    response_bytes=240,
+                    upstream_ms=17,
+                    error_kind="upstream_status_fallback",
+                    prompt_tokens=200,
+                    completion_tokens=100,
+                    total_tokens=300,
+                )
+                seeded_store.record_request(
+                    started_at=window_start,
+                    finished_at=window_start + timedelta(minutes=40),
+                    client_id="chat-client",
+                    upstream_id="backup",
+                    requested_model="gpt-test",
+                    method="POST",
+                    path="/v1/chat/completions",
+                    status_code=201,
+                    forwarded=True,
+                    request_bytes=120,
+                    response_bytes=240,
+                    upstream_ms=19,
+                    error_kind=None,
+                    prompt_tokens=800,
+                    completion_tokens=400,
+                    total_tokens=1200,
+                )
+                seeded_store.record_request(
+                    started_at=window_start,
+                    finished_at=window_end,
+                    client_id="chat-client",
+                    upstream_id="backup",
+                    requested_model="gpt-test",
+                    method="POST",
+                    path="/v1/chat/completions",
+                    status_code=200,
+                    forwarded=True,
+                    request_bytes=120,
+                    response_bytes=240,
+                    upstream_ms=21,
+                    error_kind=None,
+                    prompt_tokens=999,
+                    completion_tokens=999,
+                    total_tokens=1998,
+                )
+            finally:
+                seeded_store.close()
+
+            with RelayServer(config_path):
+                status, _, payload_bytes = make_request(
+                    relay_port,
+                    "GET",
+                    "/_relay/upstream-costs?start=2026-04-15T00:00:00%2B00:00&end=2026-04-15T01:00:00%2B00:00",
+                    headers={"X-Relay-Admin-Key": "relay-admin"},
+                )
+
+        self.assertEqual(status, 200)
+        summary = json.loads(payload_bytes)
+        self.assertEqual(summary["time_range"]["field"], "finished_at")
+        self.assertEqual(summary["totals"]["requests"], 3)
+        self.assertEqual(summary["totals"]["successes"], 2)
+        self.assertEqual(summary["totals"]["failures"], 1)
+        upstreams = {item["upstream_id"]: item for item in summary["upstreams"]}
+        self.assertEqual(upstreams["primary"]["status_codes"], {"200": 1, "502": 1})
+        self.assertEqual(upstreams["backup"]["status_codes"], {"201": 1})
+        self.assertEqual(
+            upstreams["backup"]["usage"]["estimated_cost"],
+            {
+                "currency": "USD",
+                "estimated_requests": 1,
+                "input": 0.0004,
+                "output": 0.0006,
+                "total": 0.001,
+            },
+        )
+
     def test_health_endpoint_reports_reload_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "relay-config.json"
