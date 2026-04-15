@@ -6,15 +6,21 @@ import http.client
 import json
 import select
 import sqlite3
+import socket
+import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import SplitResult, parse_qs, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 
@@ -31,6 +37,63 @@ HOP_BY_HOP_HEADERS = {
 CAPTURE_BODY_LIMIT = 1_000_000
 REQUEST_LOG_TABLE = "request_log_v4"
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
+DEFAULT_COST_CURRENCY = "USD"
+TOKENS_PER_MILLION = Decimal("1000000")
+COST_PRECISION = Decimal("0.00000001")
+DEFAULT_PROBE_METHOD = "GET"
+DEFAULT_PROBE_PATH = "/models"
+DEFAULT_TIMEOUT_SECONDS = 10.0
+DEFAULT_MAX_PARALLEL_PROBES = 8
+UNSUPPORTED_ENDPOINT_STATUS_CODES = {404, 405, 501}
+DEFAULT_MODELS_PATH = "/models"
+DEFAULT_RESPONSES_PATH = "/responses"
+DEFAULT_CHAT_COMPLETIONS_PATH = "/chat/completions"
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
+DEFAULT_PREVIEW_MODEL_LIMIT = 5
+DEFAULT_REPLY_PREVIEW_CHARS = 160
+DEFAULT_RESPONSES_INPUT = "Reply with: pong"
+DEFAULT_CHAT_MESSAGE = "Reply with: pong"
+RESPONSES_MODEL_PREFIXES = ("gpt-5", "gpt-4.1", "o1", "o3", "o4")
+STREAM_REQUIRED_ERROR_MARKERS = (
+    "stream must be true",
+    "stream=true",
+    "stream is required",
+    "streaming is required",
+)
+RESPONSES_FALLBACK_ERROR_MARKERS = (
+    "responses endpoint not supported",
+    "responses api is not supported",
+    "responses are not supported",
+    "unsupported endpoint",
+    "chat/completions",
+    "chat completions",
+)
+NON_TEXT_MODEL_MARKERS = (
+    "embedding",
+    "moderation",
+    "whisper",
+    "tts",
+    "audio",
+    "image",
+    "rerank",
+)
+TEXT_MODEL_HINTS = (
+    "gpt",
+    "claude",
+    "gemini",
+    "deepseek",
+    "qwen",
+    "llama",
+    "mistral",
+    "command",
+    "glm",
+    "yi",
+    "kimi",
+    "doubao",
+    "o1",
+    "o3",
+    "o4",
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +115,24 @@ class UpstreamConfig:
             return int(self.transport.get("timeout_seconds") or default)
         except (TypeError, ValueError):
             return default
+
+
+@dataclass(frozen=True)
+class TokenPrice:
+    input_per_million_tokens: Decimal
+    output_per_million_tokens: Decimal
+
+
+@dataclass(frozen=True)
+class UpstreamPricing:
+    default_price: TokenPrice | None
+    model_prices: dict[str, TokenPrice]
+
+
+@dataclass(frozen=True)
+class PricingCatalog:
+    currency: str
+    upstreams: dict[str, UpstreamPricing]
 
 
 @dataclass(frozen=True)
@@ -114,6 +195,7 @@ class RelayConfig:
     local_clients: list[LocalClientConfig]
     upstreams: list[UpstreamConfig]
     order: list[str]
+    pricing: PricingCatalog | None = None
 
     @property
     def local_clients_by_key(self) -> dict[str, LocalClientConfig]:
@@ -166,6 +248,10 @@ class RelayConfig:
                 raise ValueError(f"order references unknown upstream {upstream_id}")
 
         database_path = Path(server_payload.get("database_path") or "state/local_api_relay.sqlite3")
+        pricing = _load_pricing_catalog(
+            payload.get("pricing"),
+            upstreams_payload=upstreams_payload,
+        )
         return cls(
             listen_host=str(server_payload.get("listen_host") or "127.0.0.1"),
             listen_port=int(server_payload.get("listen_port") or 8787),
@@ -176,6 +262,7 @@ class RelayConfig:
             local_clients=local_clients,
             upstreams=upstreams,
             order=order,
+            pricing=pricing,
         )
 
 
@@ -512,7 +599,7 @@ class UsageStore:
             "attempts": attempts,
         }
 
-    def stats_summary(self) -> dict[str, Any]:
+    def stats_summary(self, *, config: RelayConfig | None = None) -> dict[str, Any]:
         with self.lock:
             totals_row = self.connection.execute(_summary_query()).fetchone()
             totals_status_rows = self.connection.execute(
@@ -549,12 +636,25 @@ class UsageStore:
                     "requested_model",
                 )
             ).fetchall()
+            usage_rows = self.connection.execute(
+                f"""
+                SELECT
+                    client_id,
+                    upstream_id,
+                    requested_model,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens
+                FROM {REQUEST_LOG_TABLE}
+                WHERE upstream_id IS NOT NULL
+                """
+            ).fetchall()
             active_requests = self.active_requests
             active_requests_by_client = dict(self.active_requests_by_client)
             active_requests_by_upstream = dict(self.active_requests_by_upstream)
             active_requests_by_model = dict(self.active_requests_by_model)
 
-        return {
+        payload = {
             "totals": _build_summary_payload(
                 totals_row,
                 status_codes=_status_code_counts(totals_status_rows),
@@ -580,6 +680,11 @@ class UsageStore:
                 active_counts=active_requests_by_model,
             ),
         }
+        return _augment_stats_payload(
+            payload,
+            usage_rows=usage_rows,
+            pricing=config.pricing if config is not None else None,
+        )
 
     def idle_status(self, window_seconds: int) -> dict[str, Any]:
         cutoff = _serialize_datetime(datetime.fromtimestamp(time.time() - window_seconds, tz=timezone.utc))
@@ -1246,7 +1351,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if parsed_path.path == "/_relay/stats":
-            self._send_json(200, runtime.usage_store.stats_summary())
+            self._send_json(200, runtime.usage_store.stats_summary(config=runtime.config))
             return
         if parsed_path.path == "/_relay/idle":
             self._send_json(200, runtime.usage_store.idle_status(runtime.config.idle_window_seconds))
@@ -2360,6 +2465,219 @@ def _empty_summary_payload(in_flight_requests: int) -> dict[str, Any]:
     }
 
 
+def _augment_stats_payload(
+    payload: dict[str, Any],
+    *,
+    usage_rows: list[sqlite3.Row],
+    pricing: PricingCatalog | None,
+) -> dict[str, Any]:
+    totals_bucket = _new_usage_enrichment_bucket()
+    client_buckets: dict[str, dict[str, Any]] = {
+        str(item["client_id"]): _new_usage_enrichment_bucket()
+        for item in payload.get("clients", [])
+        if item.get("client_id")
+    }
+    upstream_buckets: dict[str, dict[str, Any]] = {
+        str(item["upstream_id"]): _new_usage_enrichment_bucket()
+        for item in payload.get("upstreams", [])
+        if item.get("upstream_id")
+    }
+    model_buckets: dict[str, dict[str, Any]] = {
+        str(item["model"]): _new_usage_enrichment_bucket()
+        for item in payload.get("models", [])
+        if item.get("model")
+    }
+
+    for row in usage_rows:
+        _accumulate_usage_enrichment(totals_bucket, row, pricing=pricing)
+
+        client_id = str(row["client_id"] or "").strip()
+        if client_id and client_id in client_buckets:
+            _accumulate_usage_enrichment(client_buckets[client_id], row, pricing=pricing)
+
+        upstream_id = str(row["upstream_id"] or "").strip()
+        if upstream_id and upstream_id in upstream_buckets:
+            _accumulate_usage_enrichment(upstream_buckets[upstream_id], row, pricing=pricing)
+
+        requested_model = str(row["requested_model"] or "").strip()
+        if requested_model and client_id and requested_model in model_buckets:
+            _accumulate_usage_enrichment(model_buckets[requested_model], row, pricing=pricing)
+
+    currency = pricing.currency if pricing is not None else DEFAULT_COST_CURRENCY
+    payload["totals"]["usage"]["estimated_cost"] = _finalize_estimated_cost(totals_bucket, currency=currency)
+    for item in payload.get("clients", []):
+        bucket = client_buckets.get(str(item.get("client_id") or ""))
+        item["usage"]["estimated_cost"] = _finalize_estimated_cost(bucket, currency=currency)
+    for item in payload.get("upstreams", []):
+        bucket = upstream_buckets.get(str(item.get("upstream_id") or ""))
+        item["usage"]["estimated_cost"] = _finalize_estimated_cost(bucket, currency=currency)
+    for item in payload.get("models", []):
+        bucket = model_buckets.get(str(item.get("model") or ""))
+        item["usage"]["estimated_cost"] = _finalize_estimated_cost(bucket, currency=currency)
+
+    payload["usage_policy"] = _usage_policy()
+    payload["usage_coverage"] = _finalize_usage_coverage(totals_bucket)
+    return payload
+
+
+def _new_usage_enrichment_bucket() -> dict[str, Any]:
+    return {
+        "estimated_requests": 0,
+        "_estimated_input": Decimal("0"),
+        "_estimated_output": Decimal("0"),
+        "_requests": 0,
+        "_prompt_token_requests": 0,
+        "_completion_token_requests": 0,
+        "_total_token_requests": 0,
+        "_missing_estimated_pricing_config": 0,
+        "_missing_estimated_pricing_rule": 0,
+        "_missing_estimated_prompt_and_completion_tokens": 0,
+    }
+
+
+def _accumulate_usage_enrichment(
+    bucket: dict[str, Any],
+    row: sqlite3.Row,
+    *,
+    pricing: PricingCatalog | None,
+) -> None:
+    prompt_tokens = _coerce_optional_int(row["prompt_tokens"])
+    completion_tokens = _coerce_optional_int(row["completion_tokens"])
+    total_tokens = _coerce_optional_int(row["total_tokens"])
+    bucket["_requests"] += 1
+    if prompt_tokens is not None:
+        bucket["_prompt_token_requests"] += 1
+    if completion_tokens is not None:
+        bucket["_completion_token_requests"] += 1
+    if total_tokens is not None:
+        bucket["_total_token_requests"] += 1
+
+    estimated_cost, missing_reason = _estimate_row_cost(
+        pricing=pricing,
+        upstream_id=row["upstream_id"],
+        requested_model=row["requested_model"],
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+    if estimated_cost is None:
+        if missing_reason == "missing_pricing_config":
+            bucket["_missing_estimated_pricing_config"] += 1
+        elif missing_reason == "missing_pricing_rule":
+            bucket["_missing_estimated_pricing_rule"] += 1
+        elif missing_reason == "missing_prompt_and_completion_tokens":
+            bucket["_missing_estimated_prompt_and_completion_tokens"] += 1
+        return
+
+    bucket["estimated_requests"] += 1
+    bucket["_estimated_input"] += estimated_cost["input"]
+    bucket["_estimated_output"] += estimated_cost["output"]
+
+
+def _estimate_row_cost(
+    *,
+    pricing: PricingCatalog | None,
+    upstream_id: Any,
+    requested_model: Any,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+) -> tuple[dict[str, Decimal] | None, str | None]:
+    if pricing is None:
+        return None, "missing_pricing_config"
+    upstream_pricing = pricing.upstreams.get(str(upstream_id or ""))
+    if upstream_pricing is None:
+        return None, "missing_pricing_config"
+    price = _resolve_token_price(upstream_pricing, requested_model=requested_model)
+    if price is None:
+        return None, "missing_pricing_rule"
+    if prompt_tokens is None and completion_tokens is None:
+        return None, "missing_prompt_and_completion_tokens"
+    return (
+        {
+            "input": (Decimal(prompt_tokens or 0) * price.input_per_million_tokens) / TOKENS_PER_MILLION,
+            "output": (Decimal(completion_tokens or 0) * price.output_per_million_tokens) / TOKENS_PER_MILLION,
+        },
+        None,
+    )
+
+
+def _resolve_token_price(upstream_pricing: UpstreamPricing, *, requested_model: Any) -> TokenPrice | None:
+    normalized_model = str(requested_model or "").strip().lower()
+    if normalized_model and normalized_model in upstream_pricing.model_prices:
+        return upstream_pricing.model_prices[normalized_model]
+    return upstream_pricing.default_price
+
+
+def _finalize_estimated_cost(bucket: dict[str, Any] | None, *, currency: str) -> dict[str, Any]:
+    if bucket is None:
+        bucket = _new_usage_enrichment_bucket()
+    estimated_input = Decimal(bucket["_estimated_input"])
+    estimated_output = Decimal(bucket["_estimated_output"])
+    return {
+        "currency": currency,
+        "estimated_requests": int(bucket["estimated_requests"]),
+        "input": _decimal_to_float(estimated_input),
+        "output": _decimal_to_float(estimated_output),
+        "total": _decimal_to_float(estimated_input + estimated_output),
+    }
+
+
+def _finalize_usage_coverage(bucket: dict[str, Any]) -> dict[str, Any]:
+    request_count = int(bucket["_requests"])
+    estimated_requests = int(bucket["estimated_requests"])
+    return {
+        "window_requests": request_count,
+        "prompt_tokens": {
+            "recorded_requests": int(bucket["_prompt_token_requests"]),
+            "missing_requests": request_count - int(bucket["_prompt_token_requests"]),
+        },
+        "completion_tokens": {
+            "recorded_requests": int(bucket["_completion_token_requests"]),
+            "missing_requests": request_count - int(bucket["_completion_token_requests"]),
+        },
+        "total_tokens": {
+            "recorded_requests": int(bucket["_total_token_requests"]),
+            "missing_requests": request_count - int(bucket["_total_token_requests"]),
+        },
+        "estimated_cost": {
+            "estimated_requests": estimated_requests,
+            "missing_requests": request_count - estimated_requests,
+            "missing_breakdown": {
+                "missing_pricing_config": int(bucket["_missing_estimated_pricing_config"]),
+                "missing_pricing_rule": int(bucket["_missing_estimated_pricing_rule"]),
+                "missing_prompt_and_completion_tokens": int(
+                    bucket["_missing_estimated_prompt_and_completion_tokens"]
+                ),
+            },
+        },
+    }
+
+
+def _usage_policy() -> dict[str, Any]:
+    return {
+        "token_usage": {
+            "prompt_tokens": "request_log_v4.prompt_tokens",
+            "completion_tokens": "request_log_v4.completion_tokens",
+            "total_tokens": "request_log_v4.total_tokens",
+            "cached_tokens": "request_log_v4.cached_tokens",
+        },
+        "estimated_cost": {
+            "label": "estimated_cost",
+            "estimated": True,
+            "source": "relay pricing config x request_log_v4.prompt_tokens/completion_tokens",
+        },
+        "missing_scenarios": [
+            "Rows with NULL token columns do not contribute to token usage aggregates.",
+            "Rows without pricing config or a matching pricing rule do not contribute to estimated_cost.",
+            "Rows without prompt_tokens and completion_tokens cannot produce estimated_cost, even if total_tokens is present.",
+        ],
+    }
+
+
+def _decimal_to_float(value: Decimal) -> float:
+    quantized = value.quantize(COST_PRECISION, rounding=ROUND_HALF_UP)
+    return float(quantized.normalize())
+
+
 def _read_full_response_body(response: http.client.HTTPResponse) -> tuple[int, bytes]:
     chunks: list[bytes] = []
     total_bytes = 0
@@ -2395,6 +2713,74 @@ def _coerce_dict(value: Any) -> dict[str, Any]:
     return value
 
 
+def _load_pricing_catalog(
+    raw_pricing: Any,
+    *,
+    upstreams_payload: dict[str, Any],
+) -> PricingCatalog | None:
+    if raw_pricing is not None:
+        pricing_payload = _as_dict(raw_pricing, "pricing")
+        upstream_pricing_payload = _as_dict(pricing_payload.get("upstreams"), "pricing.upstreams")
+        upstreams: dict[str, UpstreamPricing] = {}
+        for upstream_id, raw_upstream in upstream_pricing_payload.items():
+            upstreams[str(upstream_id)] = _load_upstream_pricing(
+                _as_dict(raw_upstream, f"pricing.upstreams.{upstream_id}")
+            )
+        return PricingCatalog(
+            currency=str(pricing_payload.get("currency") or DEFAULT_COST_CURRENCY),
+            upstreams=upstreams,
+        )
+
+    inline_upstreams: dict[str, UpstreamPricing] = {}
+    for upstream_id, raw_upstream in upstreams_payload.items():
+        upstream_payload = _as_dict(raw_upstream, f"upstreams.{upstream_id}")
+        raw_inline_pricing = upstream_payload.get("pricing")
+        if raw_inline_pricing is None:
+            continue
+        inline_upstreams[str(upstream_id)] = _load_upstream_pricing(
+            _as_dict(raw_inline_pricing, f"upstreams.{upstream_id}.pricing")
+        )
+    if not inline_upstreams:
+        return None
+    return PricingCatalog(
+        currency=DEFAULT_COST_CURRENCY,
+        upstreams=inline_upstreams,
+    )
+
+
+def _load_upstream_pricing(payload: dict[str, Any]) -> UpstreamPricing:
+    default_price = None
+    if "input_per_million_tokens" in payload or "output_per_million_tokens" in payload:
+        default_price = _load_token_price(payload, "pricing default")
+    model_prices: dict[str, TokenPrice] = {}
+    models_payload = _coerce_dict(payload.get("models"))
+    for model_id, raw_model in models_payload.items():
+        model_prices[str(model_id).strip().lower()] = _load_token_price(
+            _as_dict(raw_model, f"pricing.models.{model_id}"),
+            f"pricing.models.{model_id}",
+        )
+    return UpstreamPricing(default_price=default_price, model_prices=model_prices)
+
+
+def _load_token_price(payload: dict[str, Any], label: str) -> TokenPrice:
+    return TokenPrice(
+        input_per_million_tokens=_coerce_decimal(payload.get("input_per_million_tokens"), f"{label}.input_per_million_tokens"),
+        output_per_million_tokens=_coerce_decimal(payload.get("output_per_million_tokens"), f"{label}.output_per_million_tokens"),
+    )
+
+
+def _coerce_decimal(value: Any, label: str) -> Decimal:
+    if value is None:
+        raise ValueError(f"{label} is required")
+    try:
+        decimal_value = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{label} must be a number") from exc
+    if decimal_value < 0:
+        raise ValueError(f"{label} must be >= 0")
+    return decimal_value
+
+
 def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"", "0", "false", "no", "off"}
@@ -2426,20 +2812,1144 @@ def _hash_config_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Local API relay")
-    parser.add_argument("--config", required=True, help="Path to relay config JSON")
-    return parser.parse_args()
+def probe_upstreams(
+    config_path: str | Path,
+    *,
+    upstream_ids: list[str] | None = None,
+    probe_path: str = DEFAULT_PROBE_PATH,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    resolved_config_path = Path(config_path).expanduser().resolve()
+    config = RelayConfig.load(resolved_config_path)
+    targets = _select_operator_upstreams(config, upstream_ids=upstream_ids)
+    results = _parallel_map(
+        targets,
+        lambda upstream: _probe_upstream(upstream, probe_path=probe_path, timeout_seconds=timeout_seconds),
+    )
+    successes = sum(1 for item in results if bool(item["success"]))
+    return {
+        "config_path": str(resolved_config_path),
+        "probe": {
+            "method": DEFAULT_PROBE_METHOD,
+            "path": _normalize_probe_path(probe_path),
+        },
+        "selected_upstream_ids": [target.upstream_id for target in targets],
+        "summary": {
+            "total": len(results),
+            "successes": successes,
+            "failures": len(results) - successes,
+        },
+        "upstreams": results,
+    }
 
 
-def main() -> None:
-    args = parse_args()
-    service = RelayService(args.config)
+def query_upstream_credits(
+    config_path: str | Path,
+    *,
+    upstream_ids: list[str] | None = None,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    resolved_config_path = Path(config_path).expanduser().resolve()
+    config = RelayConfig.load(resolved_config_path)
+    targets = _select_operator_upstreams(config, upstream_ids=upstream_ids)
+    results = _parallel_map(
+        targets,
+        lambda upstream: _query_upstream_credits(upstream, timeout_seconds=timeout_seconds),
+    )
+    return {
+        "config_path": str(resolved_config_path),
+        "selected_upstream_ids": [target.upstream_id for target in targets],
+        "summary": {
+            "total": len(results),
+            "supported": sum(1 for item in results if str(item["status"]) == "supported"),
+            "unsupported": sum(1 for item in results if str(item["status"]) == "unsupported"),
+            "failures": sum(1 for item in results if str(item["status"]) == "request_failed"),
+            "disabled": sum(1 for item in results if str(item["status"]) == "disabled"),
+        },
+        "upstreams": results,
+    }
+
+
+def exercise_upstreams(
+    config_path: str | Path,
+    *,
+    upstream_ids: list[str] | None = None,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    resolved_config_path = Path(config_path).expanduser().resolve()
+    config = RelayConfig.load(resolved_config_path)
+    targets = _select_operator_upstreams(config, upstream_ids=upstream_ids)
+    results = _parallel_map(
+        targets,
+        lambda upstream: _exercise_upstream(upstream, timeout_seconds=timeout_seconds),
+    )
+    return {
+        "config_path": str(resolved_config_path),
+        "selected_upstream_ids": [target.upstream_id for target in targets],
+        "summary": {
+            "total": len(results),
+            "models_successes": sum(1 for item in results if bool(item["models"]["success"])),
+            "request_successes": sum(1 for item in results if bool(item["request"]["success"])),
+            "failures": sum(1 for item in results if not bool(item["success"])),
+        },
+        "upstreams": results,
+    }
+
+
+def _select_operator_upstreams(
+    config: RelayConfig,
+    *,
+    upstream_ids: list[str] | None,
+) -> list[UpstreamConfig]:
+    upstreams_by_id = config.upstreams_by_id
+    if upstream_ids:
+        selected: list[UpstreamConfig] = []
+        seen_ids: set[str] = set()
+        for raw_upstream_id in upstream_ids:
+            upstream_id = str(raw_upstream_id)
+            if upstream_id in seen_ids:
+                continue
+            upstream = upstreams_by_id.get(upstream_id)
+            if upstream is None:
+                raise ValueError(f"unknown upstream_id: {upstream_id}")
+            selected.append(upstream)
+            seen_ids.add(upstream_id)
+        return selected
+
+    ordered_upstreams: list[UpstreamConfig] = []
+    seen_ids: set[str] = set()
+    for upstream_id in config.order:
+        upstream = upstreams_by_id.get(upstream_id)
+        if upstream is None or upstream_id in seen_ids:
+            continue
+        ordered_upstreams.append(upstream)
+        seen_ids.add(upstream_id)
+    for upstream_id in sorted(upstreams_by_id):
+        if upstream_id in seen_ids:
+            continue
+        ordered_upstreams.append(upstreams_by_id[upstream_id])
+    return [upstream for upstream in ordered_upstreams if upstream.enabled]
+
+
+def _parallel_map(
+    upstreams: list[UpstreamConfig],
+    func: Any,
+) -> list[dict[str, Any]]:
+    if not upstreams:
+        return []
+    if len(upstreams) == 1:
+        return [func(upstreams[0])]
+    max_workers = min(len(upstreams), DEFAULT_MAX_PARALLEL_PROBES)
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="relay-operator") as executor:
+        futures = [executor.submit(func, upstream) for upstream in upstreams]
+        return [future.result() for future in futures]
+
+
+def _probe_upstream(
+    upstream: UpstreamConfig,
+    *,
+    probe_path: str,
+    timeout_seconds: float | None,
+) -> dict[str, Any]:
+    if not upstream.enabled:
+        return {
+            "upstream_id": upstream.upstream_id,
+            "base_url": upstream.base_url,
+            "enabled": False,
+            "success": False,
+            "status_code": None,
+            "error_kind": "disabled",
+            "error": "upstream is disabled in relay config",
+            "latency_ms": 0,
+        }
+
+    request = Request(
+        _build_probe_url(upstream.base_url, probe_path),
+        method=DEFAULT_PROBE_METHOD,
+        headers={
+            "Authorization": f"Bearer {upstream.api_key}",
+            "Accept": "application/json",
+            "User-Agent": "local-api-relay-probe/1",
+        },
+    )
+    started_at = time.perf_counter()
     try:
-        service.serve_forever()
-    except KeyboardInterrupt:
-        service.shutdown()
+        with urlopen(request, timeout=_coerce_timeout(timeout_seconds, upstream.timeout_seconds(DEFAULT_TIMEOUT_SECONDS))) as response:
+            response.read()
+            return {
+                "upstream_id": upstream.upstream_id,
+                "base_url": upstream.base_url,
+                "enabled": True,
+                "success": True,
+                "status_code": int(getattr(response, "status", response.getcode())),
+                "error_kind": None,
+                "error": None,
+                "latency_ms": _operator_duration_ms(started_at),
+            }
+    except HTTPError as exc:
+        return {
+            "upstream_id": upstream.upstream_id,
+            "base_url": upstream.base_url,
+            "enabled": True,
+            "success": False,
+            "status_code": int(exc.code),
+            "error_kind": _http_error_kind(int(exc.code)),
+            "error": f"{int(exc.code)} {exc.reason}",
+            "latency_ms": _operator_duration_ms(started_at),
+        }
+    except URLError as exc:
+        return {
+            "upstream_id": upstream.upstream_id,
+            "base_url": upstream.base_url,
+            "enabled": True,
+            "success": False,
+            "status_code": None,
+            "error_kind": _network_error_kind(exc.reason),
+            "error": _stringify_error(exc.reason),
+            "latency_ms": _operator_duration_ms(started_at),
+        }
+    except OSError as exc:
+        return {
+            "upstream_id": upstream.upstream_id,
+            "base_url": upstream.base_url,
+            "enabled": True,
+            "success": False,
+            "status_code": None,
+            "error_kind": _network_error_kind(exc),
+            "error": _stringify_error(exc),
+            "latency_ms": _operator_duration_ms(started_at),
+        }
+
+
+def _query_upstream_credits(
+    upstream: UpstreamConfig,
+    *,
+    timeout_seconds: float | None,
+) -> dict[str, Any]:
+    if not upstream.enabled:
+        return _credits_result(
+            upstream,
+            status="disabled",
+            supported=False,
+            source=None,
+            status_code=None,
+            error_kind="disabled",
+            error="upstream is disabled in relay config",
+            latency_ms=0,
+        )
+
+    started_at = time.perf_counter()
+    effective_timeout = _coerce_timeout(timeout_seconds, upstream.timeout_seconds(DEFAULT_TIMEOUT_SECONDS))
+    for profile_id, profile_path in (
+        ("newapi_user_self", "/api/user/self"),
+        ("newapi_token_self", "/api/token/self"),
+    ):
+        for endpoint_url in _candidate_endpoint_urls(upstream.base_url, profile_path):
+            request = Request(
+                endpoint_url,
+                method="GET",
+                headers={
+                    "Authorization": f"Bearer {upstream.api_key}",
+                    "Accept": "application/json",
+                    "User-Agent": "local-api-relay-credits/1",
+                },
+            )
+            try:
+                with urlopen(request, timeout=effective_timeout) as response:
+                    body = response.read()
+                    status_code = int(getattr(response, "status", response.getcode()))
+            except HTTPError as exc:
+                status_code = int(exc.code)
+                if status_code in UNSUPPORTED_ENDPOINT_STATUS_CODES:
+                    continue
+                return _credits_result(
+                    upstream,
+                    status="request_failed",
+                    supported=False,
+                    source={"profile_id": profile_id, "path": profile_path},
+                    status_code=status_code,
+                    error_kind=_http_error_kind(status_code),
+                    error=f"{status_code} {exc.reason}",
+                    latency_ms=_operator_duration_ms(started_at),
+                )
+            except URLError as exc:
+                return _credits_result(
+                    upstream,
+                    status="request_failed",
+                    supported=False,
+                    source={"profile_id": profile_id, "path": profile_path},
+                    status_code=None,
+                    error_kind=_network_error_kind(exc.reason),
+                    error=_stringify_error(exc.reason),
+                    latency_ms=_operator_duration_ms(started_at),
+                )
+            except OSError as exc:
+                return _credits_result(
+                    upstream,
+                    status="request_failed",
+                    supported=False,
+                    source={"profile_id": profile_id, "path": profile_path},
+                    status_code=None,
+                    error_kind=_network_error_kind(exc),
+                    error=_stringify_error(exc),
+                    latency_ms=_operator_duration_ms(started_at),
+                )
+
+            payload = _load_json_payload(body)
+            if _payload_reports_error(payload):
+                return _credits_result(
+                    upstream,
+                    status="request_failed",
+                    supported=False,
+                    source={"profile_id": profile_id, "path": profile_path},
+                    status_code=status_code,
+                    error_kind="credits_query_rejected",
+                    error=_payload_error_message(payload),
+                    latency_ms=_operator_duration_ms(started_at),
+                )
+            credits = _extract_credits(payload)
+            if credits is None:
+                continue
+            return _credits_result(
+                upstream,
+                status="supported",
+                supported=True,
+                source={"profile_id": profile_id, "path": profile_path},
+                status_code=status_code,
+                error_kind=None,
+                error=None,
+                latency_ms=_operator_duration_ms(started_at),
+                credits=credits,
+            )
+
+    return _credits_result(
+        upstream,
+        status="unsupported",
+        supported=False,
+        source=None,
+        status_code=None,
+        error_kind="unsupported",
+        error="no supported credits endpoint matched this upstream",
+        latency_ms=_operator_duration_ms(started_at),
+    )
+
+
+def _credits_result(
+    upstream: UpstreamConfig,
+    *,
+    status: str,
+    supported: bool,
+    source: dict[str, str] | None,
+    status_code: int | None,
+    error_kind: str | None,
+    error: str | None,
+    latency_ms: int,
+    credits: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "upstream_id": upstream.upstream_id,
+        "base_url": upstream.base_url,
+        "enabled": upstream.enabled,
+        "status": status,
+        "supported": supported,
+        "source": source,
+        "status_code": status_code,
+        "error_kind": error_kind,
+        "error": error,
+        "latency_ms": latency_ms,
+        "credits": credits or _empty_credits(),
+    }
+
+
+def _exercise_upstream(
+    upstream: UpstreamConfig,
+    *,
+    timeout_seconds: float | None,
+) -> dict[str, Any]:
+    if not upstream.enabled:
+        return {
+            "upstream_id": upstream.upstream_id,
+            "base_url": upstream.base_url,
+            "enabled": False,
+            "success": False,
+            "latency_ms": 0,
+            "models": {
+                "success": False,
+                "status_code": None,
+                "error_kind": "disabled",
+                "error": "upstream is disabled in relay config",
+                "latency_ms": 0,
+                "count": None,
+                "preview": [],
+                "selected_model": None,
+            },
+            "request": {
+                "attempted": False,
+                "success": False,
+                "status_code": None,
+                "error_kind": "disabled",
+                "error": "upstream is disabled in relay config",
+                "latency_ms": 0,
+                "mode": None,
+                "path": None,
+                "model": None,
+                "reply_preview": None,
+                "usage": None,
+                "attempts": 0,
+                "compatibility_retry": None,
+            },
+        }
+
+    models_result = _fetch_models(upstream, timeout_seconds=timeout_seconds)
+    request_result = _skipped_request_result("models_failed")
+    if models_result["success"] and models_result["selected_model"]:
+        request_result = _perform_real_request(
+            upstream,
+            model=str(models_result["selected_model"]),
+            timeout_seconds=timeout_seconds,
+        )
+    return {
+        "upstream_id": upstream.upstream_id,
+        "base_url": upstream.base_url,
+        "enabled": upstream.enabled,
+        "success": bool(models_result["success"]) and bool(request_result["success"]),
+        "latency_ms": int(models_result["latency_ms"]) + int(request_result["latency_ms"]),
+        "models": models_result,
+        "request": request_result,
+    }
+
+
+def _fetch_models(
+    upstream: UpstreamConfig,
+    *,
+    timeout_seconds: float | None,
+) -> dict[str, Any]:
+    request = Request(
+        _build_probe_url(upstream.base_url, DEFAULT_MODELS_PATH),
+        method="GET",
+        headers=_operator_headers(upstream.api_key, content_type=False),
+    )
+    started_at = time.perf_counter()
+    try:
+        with urlopen(request, timeout=_coerce_timeout(timeout_seconds, upstream.timeout_seconds(DEFAULT_REQUEST_TIMEOUT_SECONDS))) as response:
+            body = response.read()
+            status_code = int(getattr(response, "status", response.getcode()))
+    except HTTPError as exc:
+        return {
+            "success": False,
+            "status_code": int(exc.code),
+            "error_kind": _http_error_kind(int(exc.code)),
+            "error": _http_error_message(exc),
+            "latency_ms": _operator_duration_ms(started_at),
+            "count": None,
+            "preview": [],
+            "selected_model": None,
+        }
+    except URLError as exc:
+        return {
+            "success": False,
+            "status_code": None,
+            "error_kind": _network_error_kind(exc.reason),
+            "error": _stringify_error(exc.reason),
+            "latency_ms": _operator_duration_ms(started_at),
+            "count": None,
+            "preview": [],
+            "selected_model": None,
+        }
+    except OSError as exc:
+        return {
+            "success": False,
+            "status_code": None,
+            "error_kind": _network_error_kind(exc),
+            "error": _stringify_error(exc),
+            "latency_ms": _operator_duration_ms(started_at),
+            "count": None,
+            "preview": [],
+            "selected_model": None,
+        }
+
+    payload = _load_json_payload(body)
+    model_ids = _extract_model_ids(payload)
+    selected_model = _select_model(model_ids)
+    if not selected_model:
+        return {
+            "success": False,
+            "status_code": status_code,
+            "error_kind": "no_models",
+            "error": "models response did not include a usable model id",
+            "latency_ms": _operator_duration_ms(started_at),
+            "count": len(model_ids),
+            "preview": model_ids[:DEFAULT_PREVIEW_MODEL_LIMIT],
+            "selected_model": None,
+        }
+    return {
+        "success": True,
+        "status_code": status_code,
+        "error_kind": None,
+        "error": None,
+        "latency_ms": _operator_duration_ms(started_at),
+        "count": len(model_ids),
+        "preview": model_ids[:DEFAULT_PREVIEW_MODEL_LIMIT],
+        "selected_model": selected_model,
+    }
+
+
+def _perform_real_request(
+    upstream: UpstreamConfig,
+    *,
+    model: str,
+    timeout_seconds: float | None,
+) -> dict[str, Any]:
+    initial_mode = _request_mode_for_model(model)
+    attempts = [
+        _perform_real_request_attempt(
+            upstream,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            mode=initial_mode,
+            path=_request_path_for_mode(initial_mode),
+            body=_request_body_for_mode(model=model, mode=initial_mode),
+        )
+    ]
+    compatibility_retry = _compatibility_retry_plan(attempts[0], model=model)
+    if compatibility_retry is not None:
+        attempts.append(
+            _perform_real_request_attempt(
+                upstream,
+                model=model,
+                timeout_seconds=timeout_seconds,
+                mode=str(compatibility_retry["mode"]),
+                path=str(compatibility_retry["path"]),
+                body=_coerce_dict(compatibility_retry["body"]),
+            )
+        )
+    final_result = dict(attempts[-1])
+    final_result["latency_ms"] = sum(int(item.get("latency_ms") or 0) for item in attempts)
+    final_result["attempts"] = len(attempts)
+    if compatibility_retry is None:
+        final_result["compatibility_retry"] = None
+    else:
+        final_result["compatibility_retry"] = {
+            "applied": True,
+            "kind": str(compatibility_retry["kind"]),
+            "initial_mode": attempts[0].get("mode"),
+            "initial_path": attempts[0].get("path"),
+            "final_mode": final_result.get("mode"),
+            "final_path": final_result.get("path"),
+        }
+    return final_result
+
+
+def _perform_real_request_attempt(
+    upstream: UpstreamConfig,
+    *,
+    model: str,
+    timeout_seconds: float | None,
+    mode: str,
+    path: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    request = Request(
+        _build_probe_url(upstream.base_url, path),
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers=_operator_headers(upstream.api_key, content_type=True),
+    )
+    started_at = time.perf_counter()
+    try:
+        with urlopen(request, timeout=_coerce_timeout(timeout_seconds, upstream.timeout_seconds(DEFAULT_REQUEST_TIMEOUT_SECONDS))) as response:
+            payload = response.read()
+            status_code = int(getattr(response, "status", response.getcode()))
+    except HTTPError as exc:
+        return {
+            "attempted": True,
+            "success": False,
+            "status_code": int(exc.code),
+            "error_kind": _http_error_kind(int(exc.code)),
+            "error": _http_error_message(exc),
+            "latency_ms": _operator_duration_ms(started_at),
+            "mode": mode,
+            "path": path,
+            "model": model,
+            "reply_preview": None,
+            "usage": None,
+        }
+    except URLError as exc:
+        return {
+            "attempted": True,
+            "success": False,
+            "status_code": None,
+            "error_kind": _network_error_kind(exc.reason),
+            "error": _stringify_error(exc.reason),
+            "latency_ms": _operator_duration_ms(started_at),
+            "mode": mode,
+            "path": path,
+            "model": model,
+            "reply_preview": None,
+            "usage": None,
+        }
+    except OSError as exc:
+        return {
+            "attempted": True,
+            "success": False,
+            "status_code": None,
+            "error_kind": _network_error_kind(exc),
+            "error": _stringify_error(exc),
+            "latency_ms": _operator_duration_ms(started_at),
+            "mode": mode,
+            "path": path,
+            "model": model,
+            "reply_preview": None,
+            "usage": None,
+        }
+
+    parsed_payload = _parse_response_payload(payload)
+    if parsed_payload is None:
+        preview = payload.decode("utf-8", errors="replace")
+        return {
+            "attempted": True,
+            "success": False,
+            "status_code": status_code,
+            "error_kind": "invalid_response_payload",
+            "error": "response body was neither JSON nor supported SSE data",
+            "latency_ms": _operator_duration_ms(started_at),
+            "mode": mode,
+            "path": path,
+            "model": model,
+            "reply_preview": _truncate_text(preview),
+            "usage": None,
+        }
+
+    return {
+        "attempted": True,
+        "success": True,
+        "status_code": status_code,
+        "error_kind": None,
+        "error": None,
+        "latency_ms": _operator_duration_ms(started_at),
+        "mode": mode,
+        "path": path,
+        "model": model,
+        "reply_preview": _extract_reply_preview(parsed_payload),
+        "usage": _extract_operator_usage(parsed_payload),
+    }
+
+
+def _compatibility_retry_plan(attempt: dict[str, Any], *, model: str) -> dict[str, Any] | None:
+    if bool(attempt.get("success")):
+        return None
+    mode = str(attempt.get("mode") or "")
+    status_code = _coerce_optional_int(attempt.get("status_code"))
+    error_text = str(attempt.get("error") or "").lower()
+    if mode == "chat.completions" and _requires_stream_retry(status_code=status_code, error_text=error_text):
+        body = _request_body_for_mode(model=model, mode=mode)
+        body["stream"] = True
+        return {
+            "kind": "stream_required",
+            "mode": mode,
+            "path": _request_path_for_mode(mode),
+            "body": body,
+        }
+    if mode == "responses" and _requires_chat_fallback(status_code=status_code, error_text=error_text):
+        fallback_mode = "chat.completions"
+        return {
+            "kind": "responses_to_chat_completions",
+            "mode": fallback_mode,
+            "path": _request_path_for_mode(fallback_mode),
+            "body": _request_body_for_mode(model=model, mode=fallback_mode),
+        }
+    return None
+
+
+def _requires_stream_retry(*, status_code: int | None, error_text: str) -> bool:
+    return status_code == 400 and any(marker in error_text for marker in STREAM_REQUIRED_ERROR_MARKERS)
+
+
+def _requires_chat_fallback(*, status_code: int | None, error_text: str) -> bool:
+    if status_code in UNSUPPORTED_ENDPOINT_STATUS_CODES:
+        return True
+    if status_code not in {400, 422}:
+        return False
+    return any(marker in error_text for marker in RESPONSES_FALLBACK_ERROR_MARKERS)
+
+
+def _skipped_request_result(error_kind: str) -> dict[str, Any]:
+    return {
+        "attempted": False,
+        "success": False,
+        "status_code": None,
+        "error_kind": error_kind,
+        "error": "request skipped because models stage did not produce a usable model",
+        "latency_ms": 0,
+        "mode": None,
+        "path": None,
+        "model": None,
+        "reply_preview": None,
+        "usage": None,
+        "attempts": 0,
+        "compatibility_retry": None,
+    }
+
+
+def _operator_headers(api_key: str, *, content_type: bool) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "User-Agent": "local-api-relay-operator/1",
+    }
+    if content_type:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def _build_probe_url(base_url: str, path: str) -> str:
+    parsed = urlsplit(base_url)
+    combined_path = parsed.path.rstrip("/") + _normalize_probe_path(path)
+    return urlunsplit((parsed.scheme, parsed.netloc, combined_path, "", ""))
+
+
+def _normalize_probe_path(path: str) -> str:
+    normalized = str(path or DEFAULT_PROBE_PATH).strip()
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    return normalized
+
+
+def _candidate_endpoint_urls(base_url: str, endpoint_path: str) -> list[str]:
+    parsed = urlsplit(base_url)
+    base_path = parsed.path.rstrip("/")
+    prefixes: list[str] = []
+    if base_path.endswith("/v1"):
+        prefixes.append(base_path[:-3])
+    elif base_path:
+        prefixes.append(base_path)
+    prefixes.append("")
+
+    urls: list[str] = []
+    seen_paths: set[str] = set()
+    for prefix in prefixes:
+        path = f"{prefix.rstrip('/')}{endpoint_path}"
+        if not path.startswith("/"):
+            path = f"/{path}"
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        urls.append(urlunsplit((parsed.scheme, parsed.netloc, path, "", "")))
+    return urls
+
+
+def _load_json_payload(body: bytes) -> Any:
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _payload_reports_error(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("success") is False:
+        return True
+    return isinstance(payload.get("error"), dict)
+
+
+def _payload_error_message(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "credits endpoint rejected request"
+    error_payload = payload.get("error")
+    if isinstance(error_payload, dict):
+        message = str(error_payload.get("message") or "").strip()
+        if message:
+            return message
+    message = str(payload.get("message") or "").strip()
+    if message:
+        return message
+    return "credits endpoint rejected request"
+
+
+def _extract_credits(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    source = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(source, dict):
+        return None
+    balance = _pick_number(source, "balance", "amount", "balance_amount", "remaining_balance")
+    quota = _pick_number(source, "quota", "credit_limit", "limit", "total_quota", "grant_quota")
+    used = _pick_number(source, "used_quota", "used", "used_amount", "consumed_quota")
+    remaining = _pick_number(
+        source,
+        "remaining",
+        "remaining_quota",
+        "remain_quota",
+        "available_quota",
+        "available_amount",
+    )
+    currency = _pick_string(source, "currency", "quota_currency", "balance_currency")
+    unit = _pick_string(source, "unit", "quota_unit")
+    if all(value is None for value in (balance, quota, used, remaining)):
+        return None
+    if unit is None:
+        if any(value is not None for value in (quota, used, remaining)):
+            unit = "quota"
+        elif balance is not None:
+            unit = "currency"
+    return {
+        "balance": balance,
+        "quota": quota,
+        "used": used,
+        "remaining": remaining,
+        "currency": currency,
+        "unit": unit,
+    }
+
+
+def _pick_number(source: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        if key not in source:
+            continue
+        value = source.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return float(Decimal(str(value).strip()))
+        except (InvalidOperation, ValueError):
+            continue
+    return None
+
+
+def _pick_string(source: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = str(source.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _empty_credits() -> dict[str, Any]:
+    return {
+        "balance": None,
+        "quota": None,
+        "used": None,
+        "remaining": None,
+        "currency": None,
+        "unit": None,
+    }
+
+
+def _parse_response_payload(payload: bytes) -> Any | None:
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _parse_sse_payload(payload)
+
+
+def _parse_sse_payload(payload: bytes) -> dict[str, Any] | None:
+    try:
+        decoded = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    text_parts: list[str] = []
+    usage: dict[str, int] | None = None
+    saw_event = False
+    for raw_line in decoded.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data:
+            continue
+        if data == "[DONE]":
+            saw_event = True
+            continue
+        try:
+            item = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        saw_event = True
+        preview = _extract_reply_preview(item)
+        if preview:
+            text_parts.append(preview)
+            usage = _extract_operator_usage(item) or usage
+            continue
+        delta_text = _extract_stream_delta_text(item)
+        if delta_text:
+            text_parts.append(delta_text)
+        usage = _extract_operator_usage(item) or usage
+    if not saw_event:
+        return None
+    payload_dict: dict[str, Any] = {}
+    combined_text = "".join(text_parts)
+    if combined_text.strip():
+        payload_dict["output_text"] = combined_text
+    if usage is not None:
+        payload_dict["usage"] = usage
+    return payload_dict or None
+
+
+def _extract_stream_delta_text(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return None
+    parts: list[str] = []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            parts.append(content)
+            continue
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+    return "".join(parts) if parts else None
+
+
+def _extract_model_ids(payload: Any) -> list[str]:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [str(item.get("id")).strip() for item in data if isinstance(item, dict) and str(item.get("id") or "").strip()]
+    if isinstance(payload, list):
+        return [str(item.get("id")).strip() for item in payload if isinstance(item, dict) and str(item.get("id") or "").strip()]
+    return []
+
+
+def _select_model(model_ids: list[str]) -> str | None:
+    if not model_ids:
+        return None
+    for model_id in model_ids:
+        normalized = model_id.lower()
+        if any(marker in normalized for marker in NON_TEXT_MODEL_MARKERS):
+            continue
+        if any(hint in normalized for hint in TEXT_MODEL_HINTS):
+            return model_id
+    for model_id in model_ids:
+        normalized = model_id.lower()
+        if any(marker in normalized for marker in NON_TEXT_MODEL_MARKERS):
+            continue
+        return model_id
+    return model_ids[0]
+
+
+def _request_mode_for_model(model: str) -> str:
+    normalized = model.lower()
+    if normalized.startswith(RESPONSES_MODEL_PREFIXES):
+        return "responses"
+    return "chat.completions"
+
+
+def _request_path_for_mode(mode: str) -> str:
+    if mode == "responses":
+        return DEFAULT_RESPONSES_PATH
+    return DEFAULT_CHAT_COMPLETIONS_PATH
+
+
+def _request_body_for_mode(*, model: str, mode: str) -> dict[str, Any]:
+    if mode == "responses":
+        return {
+            "model": model,
+            "input": DEFAULT_RESPONSES_INPUT,
+            "max_output_tokens": 16,
+        }
+    return {
+        "model": model,
+        "messages": [{"role": "user", "content": DEFAULT_CHAT_MESSAGE}],
+        "max_tokens": 16,
+    }
+
+
+def _extract_reply_preview(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return _truncate_text(output_text.strip())
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        preview = _extract_message_content(choices[0].get("message") if isinstance(choices[0], dict) else None)
+        if preview:
+            return _truncate_text(preview)
+    output = payload.get("output")
+    if isinstance(output, list):
+        for item in output:
+            preview = _extract_message_content(item)
+            if preview:
+                return _truncate_text(preview)
+    return None
+
+
+def _extract_message_content(message: Any) -> str | None:
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if not isinstance(content, list):
+        return None
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts) if parts else None
+
+
+def _extract_operator_usage(payload: Any) -> dict[str, int] | None:
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    prompt_tokens = _coerce_optional_int(usage.get("prompt_tokens"))
+    if prompt_tokens is None:
+        prompt_tokens = _coerce_optional_int(usage.get("input_tokens"))
+    completion_tokens = _coerce_optional_int(usage.get("completion_tokens"))
+    if completion_tokens is None:
+        completion_tokens = _coerce_optional_int(usage.get("output_tokens"))
+    total_tokens = _coerce_optional_int(usage.get("total_tokens"))
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+    return {
+        "prompt_tokens": prompt_tokens or 0,
+        "completion_tokens": completion_tokens or 0,
+        "total_tokens": total_tokens or 0,
+    }
+
+
+def _truncate_text(text: str) -> str:
+    stripped = text.strip()
+    if len(stripped) <= DEFAULT_REPLY_PREVIEW_CHARS:
+        return stripped
+    return f"{stripped[:DEFAULT_REPLY_PREVIEW_CHARS - 1]}…"
+
+
+def _coerce_timeout(value: Any, fallback: float) -> float:
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if timeout <= 0:
+        return fallback
+    return timeout
+
+
+def _http_error_kind(status_code: int) -> str:
+    if status_code == 401:
+        return "http_401"
+    if status_code == 403:
+        return "http_403"
+    if status_code == 429:
+        return "http_429"
+    if 500 <= status_code <= 599:
+        return "http_5xx"
+    return "http_error"
+
+
+def _network_error_kind(error: Any) -> str:
+    if isinstance(error, (socket.timeout, TimeoutError)):
+        return "timeout"
+    if isinstance(error, ConnectionRefusedError):
+        return "connection_refused"
+    if isinstance(error, socket.gaierror):
+        return "dns_error"
+    return "network_error"
+
+
+def _http_error_message(exc: HTTPError) -> str:
+    body = b""
+    if exc.fp is not None:
+        body = exc.read()
+    extracted = _extract_error_message(str(exc.headers.get("Content-Type", "")) if exc.headers else "", body)
+    return extracted or f"{int(exc.code)} {exc.reason}"
+
+
+def _operator_duration_ms(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
+
+
+def _stringify_error(error: Any) -> str:
+    message = str(error)
+    return message or error.__class__.__name__
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    known_commands = {"serve", "probe", "credits", "test"}
+    if not raw_args or raw_args[0] not in known_commands:
+        raw_args = ["serve", *raw_args]
+
+    parser = argparse.ArgumentParser(description="Local API relay")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    serve_parser = subparsers.add_parser("serve", help="Run relay server")
+    serve_parser.add_argument("--config", required=True, help="Path to relay config JSON")
+
+    probe_parser = subparsers.add_parser("probe", help="Probe upstream /models endpoints")
+    probe_parser.add_argument("--config", required=True, help="Path to relay config JSON")
+    probe_parser.add_argument("--upstream-id", dest="upstream_ids", action="append", default=None)
+    probe_parser.add_argument("--path", default=DEFAULT_PROBE_PATH)
+    probe_parser.add_argument("--timeout-seconds", type=float, default=None)
+
+    credits_parser = subparsers.add_parser("credits", help="Query upstream credits endpoints")
+    credits_parser.add_argument("--config", required=True, help="Path to relay config JSON")
+    credits_parser.add_argument("--upstream-id", dest="upstream_ids", action="append", default=None)
+    credits_parser.add_argument("--timeout-seconds", type=float, default=None)
+
+    test_parser = subparsers.add_parser("test", help="Run upstream real-request tests")
+    test_parser.add_argument("--config", required=True, help="Path to relay config JSON")
+    test_parser.add_argument("--upstream-id", dest="upstream_ids", action="append", default=None)
+    test_parser.add_argument("--timeout-seconds", type=float, default=None)
+
+    return parser.parse_args(raw_args)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.command == "serve":
+        service = RelayService(args.config)
+        try:
+            service.serve_forever()
+        except KeyboardInterrupt:
+            service.shutdown()
+        return 0
+    if args.command == "probe":
+        payload = probe_upstreams(
+            args.config,
+            upstream_ids=args.upstream_ids,
+            probe_path=args.path,
+            timeout_seconds=args.timeout_seconds,
+        )
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "credits":
+        payload = query_upstream_credits(
+            args.config,
+            upstream_ids=args.upstream_ids,
+            timeout_seconds=args.timeout_seconds,
+        )
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "test":
+        payload = exercise_upstreams(
+            args.config,
+            upstream_ids=args.upstream_ids,
+            timeout_seconds=args.timeout_seconds,
+        )
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    raise ValueError(f"unsupported command: {args.command}")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

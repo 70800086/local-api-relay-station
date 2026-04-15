@@ -2,18 +2,20 @@
 
 这版是最终最简结构。
 
-顶层只有四个 key：
+顶层正式接口现在有五个 key：
 
 - `server`
 - `local`
 - `upstreams`
 - `order`
+- `pricing`（可选，但只要要看 estimated cost，建议显式配置）
 
 目标很直接：
 
 - `local` 只描述本地客户端和它们的 `local_key`
 - `upstreams` 只描述真实上游和上游 key
 - `order` 决定 relay 对所有代理请求按什么顺序尝试上游
+- `pricing` 提供 relay 自身 stats 的 estimated cost 口径，不再依赖 tasks-service 额外适配器
 - 请求里的 `model` 原样转发，relay 不再声明“某模型走哪个源”或“某源支持哪些模型”
 
 ## 文件
@@ -114,6 +116,41 @@ cp local_api_relay.example.json local_api_relay.json
 ```
 
 relay 会严格按这个顺序尝试。
+
+### `pricing`
+
+可选，但如果希望 `/_relay/stats` 自带 `estimated_cost`，就需要配置。
+
+```json
+{
+  "pricing": {
+    "currency": "USD",
+    "upstreams": {
+      "shenfeng": {
+        "input_per_million_tokens": 0.5,
+        "output_per_million_tokens": 1.5,
+        "models": {
+          "gpt-5-mini": {
+            "input_per_million_tokens": 0.25,
+            "output_per_million_tokens": 1.0
+          }
+        }
+      },
+      "codexFor": {
+        "input_per_million_tokens": 0.6,
+        "output_per_million_tokens": 1.8
+      }
+    }
+  }
+}
+```
+
+规则：
+
+- `currency` 是 relay stats 里 `estimated_cost.currency` 的统一货币单位
+- `upstreams.<id>` 对应一个 upstream 的默认单价
+- `upstreams.<id>.models.<model>` 可以覆盖某个模型在这个 upstream 下的单价
+- 如果缺少 pricing、缺少匹配规则，或者只有 `total_tokens` 没有 `prompt_tokens/completion_tokens`，该请求不会计入 `estimated_cost`
 
 ## 请求行为
 
@@ -302,8 +339,25 @@ X-Relay-Admin-Key: <admin_key>
 - `clients`
 - `upstreams`
 - `models`
+- `usage_policy`
+- `usage_coverage`
 
 其中 `models` 统计的是请求体里原始传入的 model id，而不是 relay 改写后的模型名。
+
+其中每个 `usage` 现在至少包含：
+
+- `responses`
+- `prompt_tokens`
+- `completion_tokens`
+- `total_tokens`
+- `cached_tokens`
+- `estimated_cost`
+
+其中：
+
+- `estimated_cost` 是 relay 基于 `pricing` 与请求日志 token 字段推导出的估算值
+- `usage_policy` 会明确说明 token / estimated cost 的来源和缺失场景
+- `usage_coverage` 会明确当前 stats 口径里，多少请求具备 prompt/completion/total token，多少请求真正进入了 estimated cost
 
 ### `/_relay/request-traces?request_trace_id=<trace_id>`
 
@@ -332,3 +386,54 @@ X-Relay-Admin-Key: <admin_key>
 ### `/_relay/idle`
 
 基于最近请求时间和 in-flight 请求判断是否空闲。
+
+## Operator CLI
+
+relay 自己提供正式 operator 入口，不再需要 tasks-service 额外包一层：
+
+### 启动服务
+
+```bash
+python3 local_api_relay.py --config local_api_relay.json
+```
+
+也支持显式写成：
+
+```bash
+python3 local_api_relay.py serve --config local_api_relay.json
+```
+
+### Probe 上游
+
+```bash
+python3 local_api_relay.py probe --config local_api_relay.json
+python3 local_api_relay.py probe --config local_api_relay.json --upstream-id shenfeng
+python3 local_api_relay.py probe --config local_api_relay.json --path /models --timeout-seconds 5
+```
+
+### 查 credits
+
+```bash
+python3 local_api_relay.py credits --config local_api_relay.json
+python3 local_api_relay.py credits --config local_api_relay.json --upstream-id codexFor
+```
+
+目前会优先尝试：
+
+- `/api/user/self`
+- `/api/token/self`
+
+### 跑 real-request test
+
+```bash
+python3 local_api_relay.py test --config local_api_relay.json
+python3 local_api_relay.py test --config local_api_relay.json --upstream-id shenfeng
+```
+
+行为：
+
+- 先打 `/models`
+- 自动挑一个可用文本模型
+- `gpt-5/gpt-4.1/o1/o3/o4` 族优先走 `/responses`
+- 其他模型优先走 `/chat/completions`
+- 如果遇到兼容性报错，会在少量已知场景下自动重试（例如 `responses -> chat/completions`，或 `chat/completions` 补 `stream=true`）

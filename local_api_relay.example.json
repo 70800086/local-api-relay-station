@@ -36,5 +36,24 @@
   "order": [
     "primary-openai",
     "backup-openai"
-  ]
+  ],
+  "pricing": {
+    "currency": "USD",
+    "upstreams": {
+      "primary-openai": {
+        "input_per_million_tokens": 0.5,
+        "output_per_million_tokens": 1.5,
+        "models": {
+          "gpt-5-mini": {
+            "input_per_million_tokens": 0.25,
+            "output_per_million_tokens": 1.0
+          }
+        }
+      },
+      "backup-openai": {
+        "input_per_million_tokens": 0.6,
+        "output_per_million_tokens": 1.8
+      }
+    }
+  }
 }
