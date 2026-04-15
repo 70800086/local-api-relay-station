@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,7 @@ LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 DEFAULT_COST_CURRENCY = "USD"
 TOKENS_PER_MILLION = Decimal("1000000")
 COST_PRECISION = Decimal("0.00000001")
+BUILTIN_PRICING_CATALOG_PATH = Path(__file__).with_name("relay_model_pricing.json")
 DEFAULT_PROBE_METHOD = "GET"
 DEFAULT_PROBE_PATH = "/models"
 DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -121,6 +123,7 @@ class UpstreamConfig:
 class TokenPrice:
     input_per_million_tokens: Decimal
     output_per_million_tokens: Decimal
+    cached_input_per_million_tokens: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -644,7 +647,8 @@ class UsageStore:
                     requested_model,
                     prompt_tokens,
                     completion_tokens,
-                    total_tokens
+                    total_tokens,
+                    cached_tokens
                 FROM {REQUEST_LOG_TABLE}
                 WHERE upstream_id IS NOT NULL
                 """
@@ -734,7 +738,8 @@ class UsageStore:
                     requested_model,
                     prompt_tokens,
                     completion_tokens,
-                    total_tokens
+                    total_tokens,
+                    cached_tokens
                 FROM {REQUEST_LOG_TABLE}
                 WHERE {where_clause}
                 """,
@@ -1428,6 +1433,17 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     "reload": self.runtime_manager.reload_state_snapshot(),
                 },
             )
+            return
+        if parsed_path.path == "/_relay/pricing":
+            requested_model = (parse_qs(parsed_path.query).get("model") or [""])[0].strip()
+            if not requested_model:
+                self._send_json(200, _builtin_pricing_catalog_payload())
+                return
+            payload = _builtin_pricing_payload_for_model(requested_model)
+            if payload is None:
+                self._send_json(404, {"error": {"message": "pricing model not found"}})
+                return
+            self._send_json(200, payload)
             return
         if parsed_path.path == "/_relay/stats":
             self._send_json(200, runtime.usage_store.stats_summary(config=runtime.config))
@@ -2661,6 +2677,7 @@ def _new_usage_enrichment_bucket() -> dict[str, Any]:
     return {
         "estimated_requests": 0,
         "_estimated_input": Decimal("0"),
+        "_estimated_cached_input": Decimal("0"),
         "_estimated_output": Decimal("0"),
         "_requests": 0,
         "_prompt_token_requests": 0,
@@ -2681,6 +2698,7 @@ def _accumulate_usage_enrichment(
     prompt_tokens = _coerce_optional_int(row["prompt_tokens"])
     completion_tokens = _coerce_optional_int(row["completion_tokens"])
     total_tokens = _coerce_optional_int(row["total_tokens"])
+    cached_tokens = _coerce_optional_int(row["cached_tokens"])
     bucket["_requests"] += 1
     if prompt_tokens is not None:
         bucket["_prompt_token_requests"] += 1
@@ -2695,6 +2713,7 @@ def _accumulate_usage_enrichment(
         requested_model=row["requested_model"],
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        cached_tokens=cached_tokens,
     )
     if estimated_cost is None:
         if missing_reason == "missing_pricing_config":
@@ -2707,6 +2726,7 @@ def _accumulate_usage_enrichment(
 
     bucket["estimated_requests"] += 1
     bucket["_estimated_input"] += estimated_cost["input"]
+    bucket["_estimated_cached_input"] += estimated_cost["cached_input"]
     bucket["_estimated_output"] += estimated_cost["output"]
 
 
@@ -2717,20 +2737,30 @@ def _estimate_row_cost(
     requested_model: Any,
     prompt_tokens: int | None,
     completion_tokens: int | None,
+    cached_tokens: int | None,
 ) -> tuple[dict[str, Decimal] | None, str | None]:
-    if pricing is None:
-        return None, "missing_pricing_config"
-    upstream_pricing = pricing.upstreams.get(str(upstream_id or ""))
-    if upstream_pricing is None:
-        return None, "missing_pricing_config"
-    price = _resolve_token_price(upstream_pricing, requested_model=requested_model)
+    price, missing_reason = _resolve_effective_token_price(
+        pricing=pricing,
+        upstream_id=upstream_id,
+        requested_model=requested_model,
+    )
     if price is None:
-        return None, "missing_pricing_rule"
+        return None, missing_reason
     if prompt_tokens is None and completion_tokens is None:
         return None, "missing_prompt_and_completion_tokens"
+    prompt_token_count = max(int(prompt_tokens or 0), 0)
+    cached_token_count = 0
+    if price.cached_input_per_million_tokens is not None:
+        cached_token_count = min(max(int(cached_tokens or 0), 0), prompt_token_count)
+    non_cached_prompt_tokens = prompt_token_count - cached_token_count
     return (
         {
-            "input": (Decimal(prompt_tokens or 0) * price.input_per_million_tokens) / TOKENS_PER_MILLION,
+            "input": (Decimal(non_cached_prompt_tokens) * price.input_per_million_tokens) / TOKENS_PER_MILLION,
+            "cached_input": (
+                (Decimal(cached_token_count) * price.cached_input_per_million_tokens) / TOKENS_PER_MILLION
+                if price.cached_input_per_million_tokens is not None
+                else Decimal("0")
+            ),
             "output": (Decimal(completion_tokens or 0) * price.output_per_million_tokens) / TOKENS_PER_MILLION,
         },
         None,
@@ -2744,17 +2774,44 @@ def _resolve_token_price(upstream_pricing: UpstreamPricing, *, requested_model: 
     return upstream_pricing.default_price
 
 
+def _resolve_effective_token_price(
+    *,
+    pricing: PricingCatalog | None,
+    upstream_id: Any,
+    requested_model: Any,
+) -> tuple[TokenPrice | None, str | None]:
+    if pricing is not None:
+        upstream_pricing = pricing.upstreams.get(str(upstream_id or ""))
+        builtin_price = _builtin_token_price(requested_model)
+        if upstream_pricing is None:
+            if builtin_price is not None:
+                return builtin_price, None
+            return None, "missing_pricing_config"
+        configured_price = _resolve_token_price(upstream_pricing, requested_model=requested_model)
+        if configured_price is not None:
+            return configured_price, None
+        if builtin_price is not None:
+            return builtin_price, None
+        return None, "missing_pricing_rule"
+    builtin_price = _builtin_token_price(requested_model)
+    if builtin_price is not None:
+        return builtin_price, None
+    return None, "missing_pricing_config"
+
+
 def _finalize_estimated_cost(bucket: dict[str, Any] | None, *, currency: str) -> dict[str, Any]:
     if bucket is None:
         bucket = _new_usage_enrichment_bucket()
     estimated_input = Decimal(bucket["_estimated_input"])
+    estimated_cached_input = Decimal(bucket["_estimated_cached_input"])
     estimated_output = Decimal(bucket["_estimated_output"])
     return {
         "currency": currency,
         "estimated_requests": int(bucket["estimated_requests"]),
         "input": _decimal_to_float(estimated_input),
+        "cached_input": _decimal_to_float(estimated_cached_input),
         "output": _decimal_to_float(estimated_output),
-        "total": _decimal_to_float(estimated_input + estimated_output),
+        "total": _decimal_to_float(estimated_input + estimated_cached_input + estimated_output),
     }
 
 
@@ -2800,11 +2857,11 @@ def _usage_policy() -> dict[str, Any]:
         "estimated_cost": {
             "label": "estimated_cost",
             "estimated": True,
-            "source": "relay pricing config x request_log_v4.prompt_tokens/completion_tokens",
+            "source": "relay explicit pricing config or builtin pricing catalog x request_log_v4.prompt_tokens/completion_tokens/cached_tokens",
         },
         "missing_scenarios": [
             "Rows with NULL token columns do not contribute to token usage aggregates.",
-            "Rows without pricing config or a matching pricing rule do not contribute to estimated_cost.",
+            "Rows without an explicit pricing rule or a builtin catalog match do not contribute to estimated_cost.",
             "Rows without prompt_tokens and completion_tokens cannot produce estimated_cost, even if total_tokens is present.",
         ],
     }
@@ -2903,6 +2960,10 @@ def _load_token_price(payload: dict[str, Any], label: str) -> TokenPrice:
     return TokenPrice(
         input_per_million_tokens=_coerce_decimal(payload.get("input_per_million_tokens"), f"{label}.input_per_million_tokens"),
         output_per_million_tokens=_coerce_decimal(payload.get("output_per_million_tokens"), f"{label}.output_per_million_tokens"),
+        cached_input_per_million_tokens=_coerce_optional_decimal(
+            payload.get("cached_input_per_million_tokens"),
+            f"{label}.cached_input_per_million_tokens",
+        ),
     )
 
 
@@ -2916,6 +2977,99 @@ def _coerce_decimal(value: Any, label: str) -> Decimal:
     if decimal_value < 0:
         raise ValueError(f"{label} must be >= 0")
     return decimal_value
+
+
+def _coerce_optional_decimal(value: Any, label: str) -> Decimal | None:
+    if value is None:
+        return None
+    return _coerce_decimal(value, label)
+
+
+@lru_cache(maxsize=1)
+def _builtin_pricing_catalog_payload() -> dict[str, Any]:
+    with BUILTIN_PRICING_CATALOG_PATH.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError("builtin pricing catalog must be an object")
+    return payload
+
+
+@lru_cache(maxsize=1)
+def _builtin_pricing_lookup() -> tuple[str, dict[str, dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
+    payload = _builtin_pricing_catalog_payload()
+    currency = str(payload.get("currency") or DEFAULT_COST_CURRENCY)
+    exact_matches: dict[str, dict[str, Any]] = {}
+    prefix_matches: list[tuple[str, dict[str, Any]]] = []
+    providers_payload = _as_list(payload.get("providers"), "builtin_pricing.providers")
+    for raw_provider in providers_payload:
+        provider_payload = _as_dict(raw_provider, "builtin_pricing.providers[]")
+        provider_id = str(provider_payload.get("id") or "").strip().lower()
+        provider_label = str(provider_payload.get("label") or provider_id)
+        if not provider_id:
+            raise ValueError("builtin pricing provider.id is required")
+        for raw_model in _as_list(provider_payload.get("models"), f"builtin_pricing.providers.{provider_id}.models"):
+            model_payload = _as_dict(raw_model, f"builtin_pricing.providers.{provider_id}.models[]")
+            model_id = str(model_payload.get("id") or "").strip().lower()
+            if not model_id:
+                raise ValueError(f"builtin pricing model.id is required for provider {provider_id}")
+            aliases = [
+                str(item).strip().lower()
+                for item in _as_list(model_payload.get("aliases"), f"builtin_pricing.providers.{provider_id}.models.{model_id}.aliases")
+                if str(item).strip()
+            ]
+            pricing_payload = _as_dict(model_payload.get("pricing"), f"builtin_pricing.providers.{provider_id}.models.{model_id}.pricing")
+            entry = {
+                "provider": {
+                    "id": provider_id,
+                    "label": provider_label,
+                },
+                "model": {
+                    "id": model_id,
+                    "aliases": aliases,
+                },
+                "pricing": dict(pricing_payload),
+            }
+            match_keys = [model_id, *aliases]
+            for key in match_keys:
+                exact_matches[key] = entry
+                prefix_matches.append((key, entry))
+    prefix_matches.sort(key=lambda item: len(item[0]), reverse=True)
+    return currency, exact_matches, prefix_matches
+
+
+def _builtin_pricing_payload_for_model(requested_model: Any) -> dict[str, Any] | None:
+    currency, _, _ = _builtin_pricing_lookup()
+    entry = _builtin_pricing_entry_for_model(requested_model)
+    if entry is None:
+        return None
+    return {
+        "catalog_version": str(_builtin_pricing_catalog_payload().get("catalog_version") or ""),
+        "currency": currency,
+        "provider": dict(entry["provider"]),
+        "model": dict(entry["model"]),
+        "pricing": dict(entry["pricing"]),
+    }
+
+
+def _builtin_pricing_entry_for_model(requested_model: Any) -> dict[str, Any] | None:
+    normalized_model = str(requested_model or "").strip().lower()
+    if not normalized_model:
+        return None
+    _, exact_matches, prefix_matches = _builtin_pricing_lookup()
+    exact_match = exact_matches.get(normalized_model)
+    if exact_match is not None:
+        return exact_match
+    for prefix, entry in prefix_matches:
+        if normalized_model.startswith(f"{prefix}-"):
+            return entry
+    return None
+
+
+def _builtin_token_price(requested_model: Any) -> TokenPrice | None:
+    entry = _builtin_pricing_entry_for_model(requested_model)
+    if entry is None:
+        return None
+    return _load_token_price(_as_dict(entry["pricing"], "builtin_pricing.model.pricing"), "builtin pricing model")
 
 
 def _as_bool(value: Any) -> bool:

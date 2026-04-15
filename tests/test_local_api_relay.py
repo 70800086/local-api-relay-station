@@ -651,6 +651,35 @@ class RelayPlanningTests(unittest.TestCase):
 
 
 class RelayServerTests(unittest.TestCase):
+    def test_pricing_endpoint_returns_builtin_catalog_entry_with_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            relay_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            config_path = Path(tmp_dir) / "relay-config.json"
+            config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            with RelayServer(config_path):
+                status, _, payload_bytes = make_request(
+                    relay_port,
+                    "GET",
+                    "/_relay/pricing?model=claude-sonnet-4-6",
+                    headers={"X-Relay-Admin-Key": "relay-admin"},
+                )
+
+        self.assertEqual(status, 200)
+        pricing = json.loads(payload_bytes)
+        self.assertEqual(pricing["currency"], "USD")
+        self.assertEqual(pricing["provider"]["id"], "anthropic")
+        self.assertEqual(pricing["provider"]["label"], "Anthropic")
+        self.assertEqual(pricing["model"]["id"], "claude-sonnet-4-6")
+        self.assertEqual(pricing["pricing"]["input_per_million_tokens"], 3.0)
+        self.assertEqual(pricing["pricing"]["cached_input_per_million_tokens"], 0.3)
+        self.assertEqual(pricing["pricing"]["output_per_million_tokens"], 15.0)
+        self.assertIn("docs.anthropic.com", pricing["pricing"]["source"]["url"])
+
     def test_upstream_costs_endpoint_returns_windowed_usage_and_cost_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             relay_port = find_free_port()
@@ -776,6 +805,7 @@ class RelayServerTests(unittest.TestCase):
                 "currency": "USD",
                 "estimated_requests": 1,
                 "input": 0.0004,
+                "cached_input": 0.0,
                 "output": 0.0006,
                 "total": 0.001,
             },

@@ -8,19 +8,20 @@
 - `local`
 - `upstreams`
 - `order`
-- `pricing`（可选，但只要要看 estimated cost，建议显式配置）
+- `pricing`（可选，用于覆盖 relay 内置价格表或给私有模型单独定价）
 
 目标很直接：
 
 - `local` 只描述本地客户端和它们的 `local_key`
 - `upstreams` 只描述真实上游和上游 key
 - `order` 决定 relay 对所有代理请求按什么顺序尝试上游
-- `pricing` 提供 relay 自身 stats 的 estimated cost 口径，不再依赖 tasks-service 额外适配器
+- `pricing` 提供 relay 自身 stats 的显式覆盖口径；如果不配，relay 会回落到内置热门模型价格表
 - 请求里的 `model` 原样转发，relay 不再声明“某模型走哪个源”或“某源支持哪些模型”
 
 ## 文件
 
 - 服务脚本：`local_api_relay.py`
+- 内置价格表：`relay_model_pricing.json`
 - 配置样例：`local_api_relay.example.json`
 - 实际配置：`local_api_relay.json`
 - 测试：`tests/test_local_api_relay.py`
@@ -119,7 +120,8 @@ relay 会严格按这个顺序尝试。
 
 ### `pricing`
 
-可选，但如果希望 `/_relay/stats` 自带 `estimated_cost`，就需要配置。
+可选。relay 现在自带一份 `relay_model_pricing.json`，内置了 OpenAI / Anthropic / Gemini 的热门模型价格与来源。
+如果你不配置 `pricing`，relay 会先按请求里的 `model` 去匹配内置表；如果你配置了 `pricing`，显式配置优先，未命中时才会继续回落到内置表。
 
 ```json
 {
@@ -128,16 +130,19 @@ relay 会严格按这个顺序尝试。
     "upstreams": {
       "shenfeng": {
         "input_per_million_tokens": 0.5,
+        "cached_input_per_million_tokens": 0.05,
         "output_per_million_tokens": 1.5,
         "models": {
-          "gpt-5-mini": {
+          "gpt-5.4-mini": {
             "input_per_million_tokens": 0.25,
+            "cached_input_per_million_tokens": 0.025,
             "output_per_million_tokens": 1.0
           }
         }
       },
       "codexFor": {
         "input_per_million_tokens": 0.6,
+        "cached_input_per_million_tokens": 0.06,
         "output_per_million_tokens": 1.8
       }
     }
@@ -150,7 +155,9 @@ relay 会严格按这个顺序尝试。
 - `currency` 是 relay stats 里 `estimated_cost.currency` 的统一货币单位
 - `upstreams.<id>` 对应一个 upstream 的默认单价
 - `upstreams.<id>.models.<model>` 可以覆盖某个模型在这个 upstream 下的单价
-- 如果缺少 pricing、缺少匹配规则，或者只有 `total_tokens` 没有 `prompt_tokens/completion_tokens`，该请求不会计入 `estimated_cost`
+- `cached_input_per_million_tokens` 可选；如果请求日志里有 `cached_tokens` 且单价存在，relay 会把这部分单独计入 `estimated_cost.cached_input`
+- relay 的价格命中顺序是：`显式 upstream/model pricing` -> `显式 upstream 默认 pricing` -> `内置热门模型价格表`
+- 如果显式配置和内置表都没命中，或者只有 `total_tokens` 没有 `prompt_tokens/completion_tokens`，该请求不会计入 `estimated_cost`
 
 ## 请求行为
 
@@ -444,9 +451,26 @@ X-Relay-Admin-Key: <admin_key>
 
 其中：
 
-- `estimated_cost` 是 relay 基于 `pricing` 与请求日志 token 字段推导出的估算值
+- `estimated_cost` 是 relay 基于显式 `pricing` 或内置价格表，与请求日志 token 字段推导出的估算值
+- `estimated_cost` 现在至少包含 `input`、`cached_input`、`output`、`total`
 - `usage_policy` 会明确说明 token / estimated cost 的来源和缺失场景
 - `usage_coverage` 会明确当前 stats 口径里，多少请求具备 prompt/completion/total token，多少请求真正进入了 estimated cost
+
+### `/_relay/pricing`
+
+查询 relay 内置价格表。
+
+- 不带参数时，返回整份 catalog
+- 带 `model=<model_id>` 时，返回该模型命中的 provider、单价和 `source`
+- 支持对带后缀的模型 id 做最长前缀匹配，例如 `claude-sonnet-4-6-20260312` 会命中 `claude-sonnet-4-6`
+
+示例：
+
+```bash
+curl -s \
+  -H 'X-Relay-Admin-Key: relay-admin' \
+  'http://127.0.0.1:8787/_relay/pricing?model=claude-sonnet-4-6'
+```
 
 ### `/_relay/upstream-costs?start=<iso8601>&end=<iso8601>`
 
@@ -482,7 +506,7 @@ request log 当前与该接口直接相关的字段至少有：
 - `time_range.field` 当前固定为 `finished_at`
 - `totals` 是整个时间窗口里所有 upstream 请求的聚合
 - `upstreams[]` 每项至少包含 `upstream_id`、`requests`、`successes`、`failures`、`status_codes`、`usage`
-- `usage.estimated_cost` 与 `/_relay/stats` 复用同一套 `pricing` 推导逻辑
+- `usage.estimated_cost` 与 `/_relay/stats` 复用同一套显式 `pricing` + 内置价格表推导逻辑
 
 示例：
 

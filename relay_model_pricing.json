@@ -1,0 +1,207 @@
+{
+  "catalog_version": "2026-04-16",
+  "currency": "USD",
+  "providers": [
+    {
+      "id": "openai",
+      "label": "OpenAI",
+      "models": [
+        {
+          "id": "gpt-5.4",
+          "aliases": [],
+          "pricing": {
+            "input_per_million_tokens": 2.5,
+            "cached_input_per_million_tokens": 0.25,
+            "output_per_million_tokens": 15.0,
+            "pricing_basis": "Standard pricing, context window up to 270k input tokens",
+            "source": {
+              "label": "OpenAI API pricing",
+              "url": "https://openai.com/api/pricing/",
+              "retrieved_at": "2026-04-16"
+            }
+          }
+        },
+        {
+          "id": "gpt-5.4-mini",
+          "aliases": [],
+          "pricing": {
+            "input_per_million_tokens": 0.75,
+            "cached_input_per_million_tokens": 0.075,
+            "output_per_million_tokens": 4.5,
+            "pricing_basis": "Standard pricing, context window up to 270k input tokens",
+            "source": {
+              "label": "OpenAI API pricing",
+              "url": "https://openai.com/api/pricing/",
+              "retrieved_at": "2026-04-16"
+            }
+          }
+        },
+        {
+          "id": "gpt-5.4-nano",
+          "aliases": [],
+          "pricing": {
+            "input_per_million_tokens": 0.15,
+            "cached_input_per_million_tokens": 0.015,
+            "output_per_million_tokens": 0.6,
+            "pricing_basis": "Standard pricing, context window up to 270k input tokens",
+            "source": {
+              "label": "OpenAI API pricing",
+              "url": "https://openai.com/api/pricing/",
+              "retrieved_at": "2026-04-16"
+            }
+          }
+        },
+        {
+          "id": "gpt-5.4-pro",
+          "aliases": [],
+          "pricing": {
+            "input_per_million_tokens": 30.0,
+            "cached_input_per_million_tokens": null,
+            "output_per_million_tokens": 180.0,
+            "pricing_basis": "Standard pricing, context window up to 270k input tokens",
+            "source": {
+              "label": "OpenAI API pricing",
+              "url": "https://openai.com/api/pricing/",
+              "retrieved_at": "2026-04-16"
+            }
+          }
+        },
+        {
+          "id": "gpt-5.3-chat-latest",
+          "aliases": [],
+          "pricing": {
+            "input_per_million_tokens": 4.0,
+            "cached_input_per_million_tokens": 0.4,
+            "output_per_million_tokens": 16.0,
+            "pricing_basis": "Standard pricing",
+            "source": {
+              "label": "OpenAI developer pricing",
+              "url": "https://developers.openai.com/api/docs/pricing",
+              "retrieved_at": "2026-04-16"
+            }
+          }
+        },
+        {
+          "id": "gpt-5.3-codex",
+          "aliases": [],
+          "pricing": {
+            "input_per_million_tokens": 1.5,
+            "cached_input_per_million_tokens": 0.15,
+            "output_per_million_tokens": 6.0,
+            "pricing_basis": "Standard pricing",
+            "source": {
+              "label": "OpenAI developer pricing",
+              "url": "https://developers.openai.com/api/docs/pricing",
+              "retrieved_at": "2026-04-16"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "anthropic",
+      "label": "Anthropic",
+      "models": [
+        {
+          "id": "claude-opus-4-6",
+          "aliases": [],
+          "pricing": {
+            "input_per_million_tokens": 15.0,
+            "cached_input_per_million_tokens": 1.5,
+            "output_per_million_tokens": 75.0,
+            "pricing_basis": "Standard pricing with prompt caching write/read rates",
+            "source": {
+              "label": "Anthropic Claude pricing",
+              "url": "https://docs.anthropic.com/en/docs/about-claude/pricing",
+              "retrieved_at": "2026-04-16",
+              "model_reference_url": "https://platform.claude.com/docs/en/docs/about-claude/models/all-models"
+            }
+          }
+        },
+        {
+          "id": "claude-sonnet-4-6",
+          "aliases": [],
+          "pricing": {
+            "input_per_million_tokens": 3.0,
+            "cached_input_per_million_tokens": 0.3,
+            "output_per_million_tokens": 15.0,
+            "pricing_basis": "Standard pricing with prompt caching write/read rates",
+            "source": {
+              "label": "Anthropic Claude pricing",
+              "url": "https://docs.anthropic.com/en/docs/about-claude/pricing",
+              "retrieved_at": "2026-04-16",
+              "model_reference_url": "https://platform.claude.com/docs/en/docs/about-claude/models/all-models"
+            }
+          }
+        },
+        {
+          "id": "claude-haiku-4-5",
+          "aliases": [],
+          "pricing": {
+            "input_per_million_tokens": 1.0,
+            "cached_input_per_million_tokens": 0.1,
+            "output_per_million_tokens": 5.0,
+            "pricing_basis": "Standard pricing with prompt caching write/read rates",
+            "source": {
+              "label": "Anthropic Claude pricing",
+              "url": "https://docs.anthropic.com/en/docs/about-claude/pricing",
+              "retrieved_at": "2026-04-16",
+              "model_reference_url": "https://platform.claude.com/docs/en/docs/about-claude/models/all-models"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "gemini",
+      "label": "Google Gemini",
+      "models": [
+        {
+          "id": "gemini-2.5-pro",
+          "aliases": [],
+          "pricing": {
+            "input_per_million_tokens": 1.25,
+            "cached_input_per_million_tokens": 0.31,
+            "output_per_million_tokens": 10.0,
+            "pricing_basis": "Paid tier, prompts up to 200k tokens",
+            "source": {
+              "label": "Gemini API pricing",
+              "url": "https://ai.google.dev/gemini-api/docs/pricing",
+              "retrieved_at": "2026-04-16"
+            }
+          }
+        },
+        {
+          "id": "gemini-2.5-flash",
+          "aliases": [],
+          "pricing": {
+            "input_per_million_tokens": 0.3,
+            "cached_input_per_million_tokens": 0.075,
+            "output_per_million_tokens": 2.5,
+            "pricing_basis": "Paid tier, thinking or non-thinking",
+            "source": {
+              "label": "Gemini API pricing",
+              "url": "https://ai.google.dev/gemini-api/docs/pricing",
+              "retrieved_at": "2026-04-16"
+            }
+          }
+        },
+        {
+          "id": "gemini-2.5-flash-lite",
+          "aliases": [],
+          "pricing": {
+            "input_per_million_tokens": 0.1,
+            "cached_input_per_million_tokens": 0.025,
+            "output_per_million_tokens": 0.4,
+            "pricing_basis": "Paid tier, thinking or non-thinking",
+            "source": {
+              "label": "Gemini API pricing",
+              "url": "https://ai.google.dev/gemini-api/docs/pricing",
+              "retrieved_at": "2026-04-16"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

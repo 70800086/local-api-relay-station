@@ -170,6 +170,141 @@ class HttpServerHarness:
 
 
 class RelayOperatorTests(unittest.TestCase):
+    def test_stats_summary_uses_builtin_model_pricing_when_config_pricing_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = write_config(
+                Path(tmp_dir) / "relay-config.json",
+                upstreams={
+                    "primary": {
+                        "base_url": "https://proxy.example.com/v1",
+                        "api_key": "primary-key",
+                        "enabled": True,
+                        "transport": {"timeout_seconds": 120},
+                    }
+                },
+                order=["primary"],
+            )
+            config = relay.RelayConfig.load(config_path)
+            store = relay.UsageStore(Path(tmp_dir) / "relay.sqlite3")
+            try:
+                started_at = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+                store.record_request(
+                    started_at=started_at,
+                    finished_at=started_at,
+                    client_id="chat-client",
+                    upstream_id="primary",
+                    requested_model="gpt-5.4-mini",
+                    method="POST",
+                    path="/v1/responses",
+                    status_code=200,
+                    forwarded=True,
+                    request_bytes=120,
+                    response_bytes=240,
+                    upstream_ms=15,
+                    error_kind=None,
+                    prompt_tokens=1_000_000,
+                    completion_tokens=1_000_000,
+                    total_tokens=2_000_000,
+                    cached_tokens=250_000,
+                )
+
+                stats = store.stats_summary(config=config)
+            finally:
+                store.close()
+
+        self.assertEqual(
+            stats["totals"]["usage"]["estimated_cost"],
+            {
+                "currency": "USD",
+                "estimated_requests": 1,
+                "input": 0.5625,
+                "cached_input": 0.01875,
+                "output": 4.5,
+                "total": 5.08125,
+            },
+        )
+        self.assertEqual(
+            stats["usage_coverage"]["estimated_cost"],
+            {
+                "estimated_requests": 1,
+                "missing_requests": 0,
+                "missing_breakdown": {
+                    "missing_pricing_config": 0,
+                    "missing_pricing_rule": 0,
+                    "missing_prompt_and_completion_tokens": 0,
+                },
+            },
+        )
+        self.assertIn("builtin pricing catalog", stats["usage_policy"]["estimated_cost"]["source"])
+
+    def test_explicit_pricing_supports_cached_input_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = write_config(
+                Path(tmp_dir) / "relay-config.json",
+                upstreams={
+                    "primary": {
+                        "base_url": "https://primary.example.com/v1",
+                        "api_key": "primary-key",
+                        "enabled": True,
+                        "transport": {"timeout_seconds": 120},
+                    }
+                },
+                order=["primary"],
+                pricing={
+                    "currency": "USD",
+                    "upstreams": {
+                        "primary": {
+                            "models": {
+                                "gpt-test": {
+                                    "input_per_million_tokens": 2.0,
+                                    "cached_input_per_million_tokens": 0.5,
+                                    "output_per_million_tokens": 8.0,
+                                }
+                            }
+                        }
+                    },
+                },
+            )
+            config = relay.RelayConfig.load(config_path)
+            store = relay.UsageStore(Path(tmp_dir) / "relay.sqlite3")
+            try:
+                started_at = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+                store.record_request(
+                    started_at=started_at,
+                    finished_at=started_at,
+                    client_id="chat-client",
+                    upstream_id="primary",
+                    requested_model="gpt-test",
+                    method="POST",
+                    path="/v1/chat/completions",
+                    status_code=200,
+                    forwarded=True,
+                    request_bytes=120,
+                    response_bytes=240,
+                    upstream_ms=15,
+                    error_kind=None,
+                    prompt_tokens=100,
+                    completion_tokens=50,
+                    total_tokens=150,
+                    cached_tokens=40,
+                )
+
+                stats = store.stats_summary(config=config)
+            finally:
+                store.close()
+
+        self.assertEqual(
+            stats["totals"]["usage"]["estimated_cost"],
+            {
+                "currency": "USD",
+                "estimated_requests": 1,
+                "input": 0.00012,
+                "cached_input": 0.00002,
+                "output": 0.0004,
+                "total": 0.00054,
+            },
+        )
+
     def test_usage_store_summarizes_upstream_costs_within_time_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = write_config(
@@ -309,6 +444,7 @@ class RelayOperatorTests(unittest.TestCase):
                 "currency": "USD",
                 "estimated_requests": 3,
                 "input": 0.0016,
+                "cached_input": 0.0,
                 "output": 0.0018,
                 "total": 0.0034,
             },
@@ -320,6 +456,7 @@ class RelayOperatorTests(unittest.TestCase):
                 "currency": "USD",
                 "estimated_requests": 2,
                 "input": 0.0012,
+                "cached_input": 0.0,
                 "output": 0.0012,
                 "total": 0.0024,
             },
@@ -334,6 +471,7 @@ class RelayOperatorTests(unittest.TestCase):
                 "currency": "USD",
                 "estimated_requests": 1,
                 "input": 0.0004,
+                "cached_input": 0.0,
                 "output": 0.0006,
                 "total": 0.001,
             },
@@ -464,6 +602,7 @@ class RelayOperatorTests(unittest.TestCase):
                 "currency": "USD",
                 "estimated_requests": 2,
                 "input": 0.005,
+                "cached_input": 0.0,
                 "output": 0.004,
                 "total": 0.009,
             },
@@ -503,6 +642,7 @@ class RelayOperatorTests(unittest.TestCase):
                 "currency": "USD",
                 "estimated_requests": 2,
                 "input": 0.005,
+                "cached_input": 0.0,
                 "output": 0.004,
                 "total": 0.009,
             },
@@ -513,6 +653,7 @@ class RelayOperatorTests(unittest.TestCase):
                 "currency": "USD",
                 "estimated_requests": 0,
                 "input": 0.0,
+                "cached_input": 0.0,
                 "output": 0.0,
                 "total": 0.0,
             },
@@ -524,6 +665,7 @@ class RelayOperatorTests(unittest.TestCase):
                 "currency": "USD",
                 "estimated_requests": 1,
                 "input": 0.003,
+                "cached_input": 0.0,
                 "output": 0.002,
                 "total": 0.005,
             },
