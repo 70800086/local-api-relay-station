@@ -214,7 +214,8 @@ class UsageStore:
                     routing_snapshot_json TEXT,
                     prompt_tokens INTEGER,
                     completion_tokens INTEGER,
-                    total_tokens INTEGER
+                    total_tokens INTEGER,
+                    cached_tokens INTEGER
                 )
                 """
             )
@@ -250,6 +251,7 @@ class UsageStore:
             "attempt_index": "INTEGER",
             "terminal_outcome": "TEXT",
             "routing_snapshot_json": "TEXT",
+            "cached_tokens": "INTEGER",
         }
         for column_name, column_type in expected_columns.items():
             if column_name in existing_columns:
@@ -305,6 +307,7 @@ class UsageStore:
         attempt_index: int | None = None,
         terminal_outcome: str | None = None,
         routing_snapshot_json: str | None = None,
+        cached_tokens: int | None = None,
     ) -> None:
         with self.lock:
             self.connection.execute(
@@ -329,8 +332,9 @@ class UsageStore:
                     routing_snapshot_json,
                     prompt_tokens,
                     completion_tokens,
-                    total_tokens
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    total_tokens,
+                    cached_tokens
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _serialize_datetime(started_at),
@@ -353,6 +357,7 @@ class UsageStore:
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
+                    cached_tokens,
                 ),
             )
             self.connection.commit()
@@ -1298,6 +1303,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     prompt_tokens=None,
                     completion_tokens=None,
                     total_tokens=None,
+                    cached_tokens=None,
                 )
                 terminal_outcome = plan.error_kind
                 return
@@ -1334,6 +1340,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         prompt_tokens=None,
                         completion_tokens=None,
                         total_tokens=None,
+                        cached_tokens=None,
                     )
                     if index + 1 < len(plan.attempts):
                         continue
@@ -1375,7 +1382,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             response_bytes, captured_body = self._relay_upstream_response(response)
                         finished_at = datetime.now(timezone.utc)
                         terminal_outcome = "success" if index == 0 else "fallback_success"
-                        prompt_tokens, completion_tokens, total_tokens = _extract_usage_metrics(
+                        prompt_tokens, completion_tokens, total_tokens, cached_tokens = _extract_usage_metrics(
                             response.getheader("Content-Type", ""),
                             captured_body,
                         )
@@ -1400,6 +1407,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             prompt_tokens=prompt_tokens,
                             completion_tokens=completion_tokens,
                             total_tokens=total_tokens,
+                            cached_tokens=cached_tokens,
                         )
                         breaker_lease.mark_success()
                         runtime.usage_store.finalize_request_trace(request_trace_id, terminal_outcome)
@@ -1407,7 +1415,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
 
                     response_bytes, captured_body = _read_full_response_body(response)
                     finished_at = datetime.now(timezone.utc)
-                    prompt_tokens, completion_tokens, total_tokens = _extract_usage_metrics(
+                    prompt_tokens, completion_tokens, total_tokens, cached_tokens = _extract_usage_metrics(
                         response.getheader("Content-Type", ""),
                         captured_body,
                     )
@@ -1449,6 +1457,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         total_tokens=total_tokens,
+                        cached_tokens=cached_tokens,
                     )
                     if _should_trip_circuit_breaker(int(response.status)):
                         breaker_lease.mark_failure(
@@ -1488,6 +1497,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         prompt_tokens=None,
                         completion_tokens=None,
                         total_tokens=None,
+                        cached_tokens=None,
                     )
                     attempt_failures.append(
                         UpstreamAttemptFailure(
@@ -2099,20 +2109,68 @@ def _build_upstream_headers(headers: Any, upstream_api_key: str) -> dict[str, st
     return forwarded
 
 
-def _extract_usage_metrics(content_type: str, body: bytes) -> tuple[int | None, int | None, int | None]:
-    if not body or "application/json" not in content_type.lower():
-        return None, None, None
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        return None, None, None
-    usage = payload.get("usage")
+def _extract_usage_metrics(content_type: str, body: bytes) -> tuple[int | None, int | None, int | None, int | None]:
+    usage = _extract_usage_payload(content_type, body)
     if not isinstance(usage, dict):
-        return None, None, None
+        return None, None, None, None
     prompt_tokens = _coerce_optional_int(usage.get("prompt_tokens"))
+    if prompt_tokens is None:
+        prompt_tokens = _coerce_optional_int(usage.get("input_tokens"))
     completion_tokens = _coerce_optional_int(usage.get("completion_tokens"))
+    if completion_tokens is None:
+        completion_tokens = _coerce_optional_int(usage.get("output_tokens"))
     total_tokens = _coerce_optional_int(usage.get("total_tokens"))
-    return prompt_tokens, completion_tokens, total_tokens
+    cached_tokens = _extract_cached_tokens(usage)
+    return prompt_tokens, completion_tokens, total_tokens, cached_tokens
+
+
+def _extract_usage_payload(content_type: str, body: bytes) -> dict[str, Any] | None:
+    if not body:
+        return None
+    normalized = content_type.lower()
+    if "application/json" in normalized:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        usage = payload.get("usage")
+        return usage if isinstance(usage, dict) else None
+    if "text/event-stream" not in normalized:
+        return None
+
+    latest_usage: dict[str, Any] | None = None
+    text = body.decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            latest_usage = usage
+            continue
+        response_payload = payload.get("response")
+        if isinstance(response_payload, dict):
+            nested_usage = response_payload.get("usage")
+            if isinstance(nested_usage, dict):
+                latest_usage = nested_usage
+    return latest_usage
+
+
+def _extract_cached_tokens(usage: dict[str, Any]) -> int | None:
+    for details_key in ("prompt_tokens_details", "input_tokens_details"):
+        details = usage.get(details_key)
+        if not isinstance(details, dict):
+            continue
+        cached_tokens = _coerce_optional_int(details.get("cached_tokens"))
+        if cached_tokens is not None:
+            return cached_tokens
+    return None
 
 
 def _coerce_optional_int(value: Any) -> int | None:
@@ -2150,10 +2208,11 @@ def _summary_query() -> str:
             COALESCE(SUM(CASE WHEN forwarded = 1 THEN 1 ELSE 0 END), 0) AS forwarded,
             COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END), 0) AS successes,
             COALESCE(SUM(CASE WHEN error_kind = 'invalid_local_key' THEN 1 ELSE 0 END), 0) AS local_rejects,
-            COALESCE(SUM(CASE WHEN prompt_tokens IS NOT NULL OR completion_tokens IS NOT NULL OR total_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS usage_responses,
+            COALESCE(SUM(CASE WHEN prompt_tokens IS NOT NULL OR completion_tokens IS NOT NULL OR total_tokens IS NOT NULL OR cached_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS usage_responses,
             COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
             COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
             COALESCE(SUM(total_tokens), 0) AS total_tokens,
+            COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
             AVG(upstream_ms) AS avg_upstream_ms,
             MIN(upstream_ms) AS min_upstream_ms,
             MAX(upstream_ms) AS max_upstream_ms,
@@ -2170,10 +2229,11 @@ def _dimension_summary_query(column: str, where_clause: str, order_column: str) 
             COUNT(*) AS requests,
             COALESCE(SUM(CASE WHEN forwarded = 1 THEN 1 ELSE 0 END), 0) AS forwarded,
             COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END), 0) AS successes,
-            COALESCE(SUM(CASE WHEN prompt_tokens IS NOT NULL OR completion_tokens IS NOT NULL OR total_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS usage_responses,
+            COALESCE(SUM(CASE WHEN prompt_tokens IS NOT NULL OR completion_tokens IS NOT NULL OR total_tokens IS NOT NULL OR cached_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS usage_responses,
             COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
             COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
             COALESCE(SUM(total_tokens), 0) AS total_tokens,
+            COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
             AVG(upstream_ms) AS avg_upstream_ms,
             MIN(upstream_ms) AS min_upstream_ms,
             MAX(upstream_ms) AS max_upstream_ms,
@@ -2249,6 +2309,7 @@ def _build_summary_payload(
             "prompt_tokens": int(row["prompt_tokens"]),
             "completion_tokens": int(row["completion_tokens"]),
             "total_tokens": int(row["total_tokens"]),
+            "cached_tokens": int(row["cached_tokens"]),
         },
         "latency_ms": _latency_summary(
             requests,
@@ -2279,6 +2340,7 @@ def _empty_summary_payload(in_flight_requests: int) -> dict[str, Any]:
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
+            "cached_tokens": 0,
         },
         "latency_ms": _latency_summary(0, None, None, None),
         "in_flight_requests": in_flight_requests,

@@ -34,6 +34,25 @@ DEFAULT_UPSTREAM_BODY = json.dumps(
     }
 ).encode("utf-8")
 
+DEFAULT_RESPONSES_BODY = json.dumps(
+    {
+        "id": "resp_456",
+        "object": "response",
+        "usage": {
+            "input_tokens": 7,
+            "input_tokens_details": {"cached_tokens": 4},
+            "output_tokens": 2,
+            "total_tokens": 9,
+        },
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ok"}],
+            }
+        ],
+    }
+).encode("utf-8")
+
 
 def find_free_port() -> int:
     try:
@@ -538,6 +557,7 @@ class RelayPlanningTests(unittest.TestCase):
                     prompt_tokens=3,
                     completion_tokens=5,
                     total_tokens=8,
+                    cached_tokens=2,
                 )
                 store.record_request(
                     started_at=start,
@@ -556,6 +576,7 @@ class RelayPlanningTests(unittest.TestCase):
                     prompt_tokens=None,
                     completion_tokens=None,
                     total_tokens=None,
+                    cached_tokens=None,
                 )
                 store.record_request(
                     started_at=start,
@@ -574,6 +595,7 @@ class RelayPlanningTests(unittest.TestCase):
                     prompt_tokens=None,
                     completion_tokens=None,
                     total_tokens=None,
+                    cached_tokens=None,
                 )
 
                 stats = store.stats_summary()
@@ -586,14 +608,35 @@ class RelayPlanningTests(unittest.TestCase):
         self.assertEqual(stats["totals"]["local_rejects"], 1)
         self.assertEqual(stats["totals"]["status_codes"], {"201": 1, "401": 1, "503": 1})
         self.assertEqual(stats["totals"]["usage"]["responses"], 1)
+        self.assertEqual(stats["totals"]["usage"]["cached_tokens"], 2)
         self.assertEqual(stats["clients"][0]["client_id"], "chat-client")
         self.assertEqual(stats["clients"][0]["requests"], 2)
         upstream_stats = {item["upstream_id"]: item for item in stats["upstreams"]}
         self.assertEqual(upstream_stats["primary"]["successes"], 1)
+        self.assertEqual(upstream_stats["primary"]["usage"]["cached_tokens"], 2)
         self.assertEqual(upstream_stats["backup"]["failures"], 1)
         model_stats = {item["model"]: item for item in stats["models"]}
         self.assertEqual(model_stats["gpt-test"]["requests"], 2)
+        self.assertEqual(model_stats["gpt-test"]["usage"]["cached_tokens"], 2)
         self.assertNotIn("upstream_models", model_stats["gpt-test"])
+
+    def test_extract_usage_metrics_supports_responses_json_and_sse(self) -> None:
+        json_metrics = relay._extract_usage_metrics(
+            "application/json",
+            DEFAULT_RESPONSES_BODY,
+        )
+        self.assertEqual(json_metrics, (7, 2, 9, 4))
+
+        sse_body = (
+            b'data: {"type":"response.output_text.delta","delta":"OK"}\n\n'
+            b'data: {"type":"response.completed","response":{"usage":{"input_tokens":7,"input_tokens_details":{"cached_tokens":4},"output_tokens":2,"total_tokens":9}}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        sse_metrics = relay._extract_usage_metrics(
+            "text/event-stream",
+            sse_body,
+        )
+        self.assertEqual(sse_metrics, (7, 2, 9, 4))
 
 
 class RelayServerTests(unittest.TestCase):
