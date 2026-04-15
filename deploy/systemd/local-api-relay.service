@@ -1,9 +1,13 @@
 [Unit]
 Description=Local API Relay
+After=network-online.target
+Wants=network-online.target
 
 [Service]
+Type=simple
+User=root
 WorkingDirectory=/root/.openclaw/workspace/relay
-ExecStart=/usr/bin/python3 /root/.openclaw/workspace/relay/local_api_relay.py --config /root/.openclaw/workspace/relay/local_api_relay.json
+ExecStart=/usr/bin/python3 /root/.openclaw/workspace/relay/local_api_relay.py serve --config /root/.openclaw/workspace/relay/local_api_relay.json
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
@@ -15,4 +19,4 @@ Environment=TMPDIR=/tmp
 Environment=PYTHONDONTWRITEBYTECODE=1
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

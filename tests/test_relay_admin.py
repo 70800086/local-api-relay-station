@@ -14,7 +14,7 @@ SCRIPT_PATH = REPO_ROOT / "deploy" / "bin" / "relay-admin"
 class RelayAdminScriptTests(unittest.TestCase):
     def run_script(self, command: str, *, fake_systemctl_dir: Path) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
-        env["PATH"] = f"{fake_systemctl_dir}:{env.get('PATH', '')}"
+        env["SYSTEMCTL_BIN"] = str(fake_systemctl_dir / "systemctl")
         return subprocess.run(
             ["bash", str(SCRIPT_PATH), command],
             cwd=REPO_ROOT,
@@ -33,7 +33,7 @@ class RelayAdminScriptTests(unittest.TestCase):
                     "#!/usr/bin/env bash",
                     "set -euo pipefail",
                     f"printf '%s\\n' \"$*\" >> {calls_path}",
-                    "if [ \"$#\" -ge 4 ] && [ \"$1\" = \"--user\" ] && [ \"$4\" = \"status\" ]; then",
+                    "if [ \"$#\" -ge 3 ] && [ \"$1\" = \"--no-pager\" ] && [ \"$3\" = \"status\" ]; then",
                     "  printf 'relay active\\n'",
                     "fi",
                 ]
@@ -44,7 +44,7 @@ class RelayAdminScriptTests(unittest.TestCase):
         script_path.chmod(0o755)
         return calls_path
 
-    def test_status_calls_user_systemctl_for_local_api_relay_service(self) -> None:
+    def test_status_calls_system_systemctl_for_local_api_relay_service(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             sandbox = Path(tmp_dir)
             calls_path = self.write_fake_systemctl(sandbox)
@@ -54,10 +54,10 @@ class RelayAdminScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 calls_path.read_text(encoding="utf-8").splitlines(),
-                ["--user --no-pager --full status local-api-relay.service"],
+                ["--no-pager --full status local-api-relay.service"],
             )
 
-    def test_restart_calls_restart_then_status_for_local_api_relay_service(self) -> None:
+    def test_restart_calls_system_restart_then_status_for_local_api_relay_service(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             sandbox = Path(tmp_dir)
             calls_path = self.write_fake_systemctl(sandbox)
@@ -68,8 +68,8 @@ class RelayAdminScriptTests(unittest.TestCase):
             self.assertEqual(
                 calls_path.read_text(encoding="utf-8").splitlines(),
                 [
-                    "--user restart local-api-relay.service",
-                    "--user --no-pager --full status local-api-relay.service",
+                    "restart local-api-relay.service",
+                    "--no-pager --full status local-api-relay.service",
                 ],
             )
 
