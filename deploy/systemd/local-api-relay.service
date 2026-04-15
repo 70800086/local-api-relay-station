@@ -1,0 +1,18 @@
+[Unit]
+Description=Local API Relay
+
+[Service]
+WorkingDirectory=/root/.openclaw/workspace/relay
+ExecStart=/usr/bin/python3 /root/.openclaw/workspace/relay/local_api_relay.py --config /root/.openclaw/workspace/relay/local_api_relay.json
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+TimeoutStartSec=30
+SuccessExitStatus=0 143
+KillMode=control-group
+Environment=HOME=/root
+Environment=TMPDIR=/tmp
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+[Install]
+WantedBy=default.target

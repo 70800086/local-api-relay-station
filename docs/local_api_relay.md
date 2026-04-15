@@ -227,6 +227,32 @@ PYTHONDONTWRITEBYTECODE=1 python3 local_api_relay.py --config local_api_relay.js
 
 - `http://127.0.0.1:8787`
 
+## 当前实际 systemd 部署
+
+当前这台机器上的 relay 不是裸跑进程，而是由 `systemd --user` unit 托管：
+
+- unit 名：`local-api-relay.service`
+- unit 文件：`~/.config/systemd/user/local-api-relay.service`
+- 当前 `ExecStart`：`/usr/bin/python3 /root/.openclaw/workspace/relay/local_api_relay.py --config /root/.openclaw/workspace/relay/local_api_relay.json`
+
+仓库内的权威 unit 模板放在：
+
+- `deploy/systemd/local-api-relay.service`
+
+如果线上 unit 需要回收成仓库版本，用：
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 0644 deploy/systemd/local-api-relay.service ~/.config/systemd/user/local-api-relay.service
+systemctl --user daemon-reload
+systemctl --user enable --now local-api-relay.service
+```
+
+说明：
+
+- 模板默认假设仓库路径是 `/root/.openclaw/workspace/relay`
+- 如果部署路径不同，先改模板里的 `WorkingDirectory` 与 `ExecStart`
+
 ## 自动热重载
 
 relay 会自动轮询 `local_api_relay.json`。
@@ -434,6 +460,34 @@ curl -s \
 ## Operator CLI
 
 relay 自己提供正式 operator 入口，不再需要 tasks-service 额外包一层：
+
+### `relay-admin` 受限运维脚本
+
+统一的受限运维入口在：
+
+- `deploy/bin/relay-admin`
+
+它只允许两个动作，并且固定只操作 `local-api-relay.service`：
+
+```bash
+deploy/bin/relay-admin status
+deploy/bin/relay-admin restart
+```
+
+推荐安装方式是符号链接，不要复制脚本，避免仓库版本和机器上的副本漂移：
+
+```bash
+REPO_ROOT=/root/.openclaw/workspace/relay
+mkdir -p ~/.local/bin
+ln -sfn "$REPO_ROOT/deploy/bin/relay-admin" ~/.local/bin/relay-admin
+```
+
+同步规则：
+
+- `deploy/bin/relay-admin` 是唯一权威源码位置
+- `~/.local/bin/relay-admin` 只保留 symlink，不保留独立副本
+- 仓库更新后不需要再复制脚本；symlink 会直接跟到最新版本
+- 如果仓库搬目录了，重新执行一次上面的 `ln -sfn`
 
 ### 启动服务
 

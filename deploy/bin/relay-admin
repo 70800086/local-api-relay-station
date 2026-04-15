@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly RELAY_SYSTEMD_UNIT="local-api-relay.service"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: relay-admin <status|restart>
+
+Restricted admin entry for the relay systemd --user unit.
+EOF
+}
+
+if [ "$#" -ne 1 ]; then
+  usage
+  exit 64
+fi
+
+case "$1" in
+  status)
+    exec systemctl --user --no-pager --full status "$RELAY_SYSTEMD_UNIT"
+    ;;
+  restart)
+    systemctl --user restart "$RELAY_SYSTEMD_UNIT"
+    exec systemctl --user --no-pager --full status "$RELAY_SYSTEMD_UNIT"
+    ;;
+  *)
+    usage
+    exit 64
+    ;;
+esac
