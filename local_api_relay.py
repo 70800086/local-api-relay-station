@@ -136,6 +136,8 @@ class UpstreamPricing:
 class PricingCatalog:
     currency: str
     upstreams: dict[str, UpstreamPricing]
+    global_models: dict[str, TokenPrice] = field(default_factory=dict)
+    global_default: TokenPrice | None = None
 
 
 @dataclass(frozen=True)
@@ -2767,11 +2769,22 @@ def _estimate_row_cost(
     )
 
 
-def _resolve_token_price(upstream_pricing: UpstreamPricing, *, requested_model: Any) -> TokenPrice | None:
+def _resolve_token_price(
+    pricing: PricingCatalog,
+    *,
+    upstream_id: Any,
+    requested_model: Any,
+) -> TokenPrice | None:
     normalized_model = str(requested_model or "").strip().lower()
-    if normalized_model and normalized_model in upstream_pricing.model_prices:
-        return upstream_pricing.model_prices[normalized_model]
-    return upstream_pricing.default_price
+    upstream_pricing = pricing.upstreams.get(str(upstream_id or ""))
+    if upstream_pricing is not None:
+        if normalized_model and normalized_model in upstream_pricing.model_prices:
+            return upstream_pricing.model_prices[normalized_model]
+        if upstream_pricing.default_price is not None:
+            return upstream_pricing.default_price
+    if normalized_model and normalized_model in pricing.global_models:
+        return pricing.global_models[normalized_model]
+    return pricing.global_default
 
 
 def _resolve_effective_token_price(
@@ -2914,15 +2927,28 @@ def _load_pricing_catalog(
 ) -> PricingCatalog | None:
     if raw_pricing is not None:
         pricing_payload = _as_dict(raw_pricing, "pricing")
-        upstream_pricing_payload = _as_dict(pricing_payload.get("upstreams"), "pricing.upstreams")
+        upstream_pricing_payload = _coerce_dict(pricing_payload.get("upstreams"))
         upstreams: dict[str, UpstreamPricing] = {}
         for upstream_id, raw_upstream in upstream_pricing_payload.items():
             upstreams[str(upstream_id)] = _load_upstream_pricing(
                 _as_dict(raw_upstream, f"pricing.upstreams.{upstream_id}")
             )
+        global_default = None
+        if "input_per_million_tokens" in pricing_payload or "output_per_million_tokens" in pricing_payload:
+            global_default = _load_token_price(pricing_payload, "pricing default")
+        global_models: dict[str, TokenPrice] = {}
+        for model_id, raw_model in _coerce_dict(pricing_payload.get("models")).items():
+            global_models[str(model_id).strip().lower()] = _load_token_price(
+                _as_dict(raw_model, f"pricing.models.{model_id}"),
+                f"pricing.models.{model_id}",
+            )
+        if not upstreams and not global_models and global_default is None:
+            return None
         return PricingCatalog(
             currency=str(pricing_payload.get("currency") or DEFAULT_COST_CURRENCY),
             upstreams=upstreams,
+            global_models=global_models,
+            global_default=global_default,
         )
 
     inline_upstreams: dict[str, UpstreamPricing] = {}
@@ -2939,6 +2965,8 @@ def _load_pricing_catalog(
     return PricingCatalog(
         currency=DEFAULT_COST_CURRENCY,
         upstreams=inline_upstreams,
+        global_models={},
+        global_default=None,
     )
 
 
@@ -2957,6 +2985,7 @@ def _load_upstream_pricing(payload: dict[str, Any]) -> UpstreamPricing:
 
 
 def _load_token_price(payload: dict[str, Any], label: str) -> TokenPrice:
+    cached_input_value = payload.get("cached_input_per_million_tokens")
     return TokenPrice(
         input_per_million_tokens=_coerce_decimal(payload.get("input_per_million_tokens"), f"{label}.input_per_million_tokens"),
         output_per_million_tokens=_coerce_decimal(payload.get("output_per_million_tokens"), f"{label}.output_per_million_tokens"),
