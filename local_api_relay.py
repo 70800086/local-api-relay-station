@@ -105,6 +105,15 @@ class LocalClientConfig:
 
 
 @dataclass(frozen=True)
+class RequestBodyCaptureConfig:
+    enabled: bool = False
+    client_ids: tuple[str, ...] = ()
+    paths: tuple[str, ...] = ()
+    output_dir: Path = field(default_factory=lambda: Path("state/request-captures"))
+    max_captures: int = 1
+
+
+@dataclass(frozen=True)
 class UpstreamConfig:
     upstream_id: str
     base_url: str
@@ -201,6 +210,7 @@ class RelayConfig:
     upstreams: list[UpstreamConfig]
     order: list[str]
     pricing: PricingCatalog | None = None
+    request_body_capture: RequestBodyCaptureConfig = field(default_factory=RequestBodyCaptureConfig)
 
     @property
     def local_clients_by_key(self) -> dict[str, LocalClientConfig]:
@@ -212,7 +222,9 @@ class RelayConfig:
 
     @classmethod
     def load(cls, path: str | Path) -> "RelayConfig":
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        config_path = Path(path)
+        config_dir = config_path.expanduser().resolve().parent
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("relay config must be a JSON object")
 
@@ -253,6 +265,21 @@ class RelayConfig:
                 raise ValueError(f"order references unknown upstream {upstream_id}")
 
         database_path = Path(server_payload.get("database_path") or "state/local_api_relay.sqlite3")
+        request_body_capture_payload = _as_dict(server_payload.get("request_body_capture"), "server.request_body_capture")
+        capture_output_dir = Path(request_body_capture_payload.get("output_dir") or "state/request-captures")
+        if not capture_output_dir.is_absolute():
+            capture_output_dir = config_dir / capture_output_dir
+        request_body_capture = RequestBodyCaptureConfig(
+            enabled=_as_bool(request_body_capture_payload.get("enabled", False)),
+            client_ids=tuple(str(item).strip() for item in _as_list(request_body_capture_payload.get("client_ids"), "server.request_body_capture.client_ids") if str(item).strip()),
+            paths=tuple(
+                _normalize_request_path(str(item))
+                for item in _as_list(request_body_capture_payload.get("paths"), "server.request_body_capture.paths")
+                if str(item).strip()
+            ),
+            output_dir=capture_output_dir,
+            max_captures=max(0, int(request_body_capture_payload.get("max_captures") or 1)),
+        )
         pricing = _load_pricing_catalog(
             payload.get("pricing"),
             upstreams_payload=upstreams_payload,
@@ -268,6 +295,7 @@ class RelayConfig:
             upstreams=upstreams,
             order=order,
             pricing=pricing,
+            request_body_capture=request_body_capture,
         )
 
 
@@ -307,7 +335,11 @@ class UsageStore:
                     prompt_tokens INTEGER,
                     completion_tokens INTEGER,
                     total_tokens INTEGER,
-                    cached_tokens INTEGER
+                    cached_tokens INTEGER,
+                    prompt_cache_key TEXT,
+                    canonical_body_sha256 TEXT,
+                    stream INTEGER,
+                    reasoning_effort TEXT
                 )
                 """
             )
@@ -344,6 +376,10 @@ class UsageStore:
             "terminal_outcome": "TEXT",
             "routing_snapshot_json": "TEXT",
             "cached_tokens": "INTEGER",
+            "prompt_cache_key": "TEXT",
+            "canonical_body_sha256": "TEXT",
+            "stream": "INTEGER",
+            "reasoning_effort": "TEXT",
         }
         for column_name, column_type in expected_columns.items():
             if column_name in existing_columns:
@@ -400,6 +436,10 @@ class UsageStore:
         terminal_outcome: str | None = None,
         routing_snapshot_json: str | None = None,
         cached_tokens: int | None = None,
+        prompt_cache_key: str | None = None,
+        canonical_body_sha256: str | None = None,
+        stream: bool | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         with self.lock:
             self.connection.execute(
@@ -425,8 +465,12 @@ class UsageStore:
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
-                    cached_tokens
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cached_tokens,
+                    prompt_cache_key,
+                    canonical_body_sha256,
+                    stream,
+                    reasoning_effort
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _serialize_datetime(started_at),
@@ -450,6 +494,10 @@ class UsageStore:
                     completion_tokens,
                     total_tokens,
                     cached_tokens,
+                    prompt_cache_key,
+                    canonical_body_sha256,
+                    1 if stream else 0 if stream is not None else None,
+                    reasoning_effort,
                 ),
             )
             self.connection.commit()
@@ -490,7 +538,11 @@ class UsageStore:
                     upstream_ms,
                     error_kind,
                     terminal_outcome,
-                    routing_snapshot_json
+                    routing_snapshot_json,
+                    prompt_cache_key,
+                    canonical_body_sha256,
+                    stream,
+                    reasoning_effort
                 FROM {REQUEST_LOG_TABLE}
                 WHERE request_trace_id = ?
                 ORDER BY
@@ -559,6 +611,10 @@ class UsageStore:
                     "upstream_ms": int(row["upstream_ms"]),
                     "error_kind": row["error_kind"],
                     "terminal_outcome": row["terminal_outcome"] or terminal_outcome,
+                    "prompt_cache_key": row["prompt_cache_key"],
+                    "canonical_body_sha256": row["canonical_body_sha256"],
+                    "stream": bool(row["stream"]) if row["stream"] is not None else None,
+                    "reasoning_effort": row["reasoning_effort"],
                 }
             )
 
@@ -1501,6 +1557,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             self.headers,
             original_request_body,
             runtime._runtime.circuit_breaker,
+            request_path=self.path,
         )
         routing_snapshot_json = _serialize_json(plan.routing_snapshot())
         client_id = plan.client.client_id if plan.client is not None else None
@@ -1508,6 +1565,14 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         track_request_state = plan.error_status is None
         if track_request_state:
             runtime.usage_store.request_started(client_id, initial_upstream_id, plan.requested_model)
+        _capture_request_body(
+            runtime.config,
+            request_trace_id=request_trace_id,
+            client_id=client_id,
+            request_path=self.path,
+            request_body=original_request_body,
+            requested_model=plan.requested_model,
+        )
         terminal_outcome: str | None = None
         try:
             if plan.error_status is not None:
@@ -1539,6 +1604,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     completion_tokens=None,
                     total_tokens=None,
                     cached_tokens=None,
+                    **_request_observability_kwargs(original_request_body),
                 )
                 terminal_outcome = plan.error_kind
                 return
@@ -1576,6 +1642,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         completion_tokens=None,
                         total_tokens=None,
                         cached_tokens=None,
+                        **_request_observability_kwargs(attempt.request_body),
                     )
                     if index + 1 < len(plan.attempts):
                         continue
@@ -1591,19 +1658,28 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 )
                 connection: http.client.HTTPConnection | http.client.HTTPSConnection | None = None
                 try:
+                    forwarded_headers = _build_upstream_headers(self.headers, attempt.upstream.api_key)
+                    attempt_request_body = attempt.request_body
+                    response_bytes = 0
+                    captured_body = b""
+                    error_response_body_consumed = False
+
                     connection = connection_class(
                         parsed_target.hostname,
                         parsed_target.port,
                         timeout=attempt.upstream.timeout_seconds(runtime.config.request_timeout_seconds),
                     )
-                    forwarded_headers = _build_upstream_headers(self.headers, attempt.upstream.api_key)
                     connection.request(
                         self.command,
                         upstream_path,
-                        body=attempt.request_body,
+                        body=attempt_request_body,
                         headers=forwarded_headers,
                     )
                     response = connection.getresponse()
+
+                    if response.status >= 400 and not _is_upgrade_response(self.headers, response):
+                        response_bytes, captured_body = _read_full_response_body(response)
+                        error_response_body_consumed = True
 
                     if response.status < 400 or _is_upgrade_response(self.headers, response):
                         if _is_upgrade_response(self.headers, response):
@@ -1633,7 +1709,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             path=self.path,
                             status_code=int(response.status),
                             forwarded=True,
-                            request_bytes=len(attempt.request_body),
+                            request_bytes=len(attempt_request_body),
                             response_bytes=response_bytes,
                             upstream_ms=_duration_ms(attempt_started_at, finished_at),
                             error_kind=None,
@@ -1643,12 +1719,14 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             completion_tokens=completion_tokens,
                             total_tokens=total_tokens,
                             cached_tokens=cached_tokens,
+                            **_request_observability_kwargs(attempt_request_body),
                         )
                         breaker_lease.mark_success()
                         runtime.usage_store.finalize_request_trace(request_trace_id, terminal_outcome)
                         return
 
-                    response_bytes, captured_body = _read_full_response_body(response)
+                    if not error_response_body_consumed:
+                        response_bytes, captured_body = _read_full_response_body(response)
                     finished_at = datetime.now(timezone.utc)
                     prompt_tokens, completion_tokens, total_tokens, cached_tokens = _extract_usage_metrics(
                         response.getheader("Content-Type", ""),
@@ -1683,7 +1761,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         path=self.path,
                         status_code=int(response.status),
                         forwarded=True,
-                        request_bytes=len(attempt.request_body),
+                        request_bytes=len(attempt_request_body),
                         response_bytes=response_bytes,
                         upstream_ms=_duration_ms(attempt_started_at, finished_at),
                         error_kind="upstream_status_fallback" if can_retry else "upstream_status_exhausted",
@@ -1693,6 +1771,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         completion_tokens=completion_tokens,
                         total_tokens=total_tokens,
                         cached_tokens=cached_tokens,
+                        **_request_observability_kwargs(attempt_request_body),
                     )
                     if _should_trip_circuit_breaker(int(response.status)):
                         breaker_lease.mark_failure(
@@ -1723,7 +1802,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         path=self.path,
                         status_code=502,
                         forwarded=False,
-                        request_bytes=len(attempt.request_body),
+                        request_bytes=len(attempt_request_body),
                         response_bytes=0,
                         upstream_ms=_duration_ms(attempt_started_at, finished_at),
                         error_kind="upstream_request_failed",
@@ -1733,6 +1812,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         completion_tokens=None,
                         total_tokens=None,
                         cached_tokens=None,
+                        **_request_observability_kwargs(attempt_request_body),
                     )
                     attempt_failures.append(
                         UpstreamAttemptFailure(
@@ -2068,10 +2148,15 @@ def plan_request_attempts(
     headers: Any,
     request_body: bytes,
     circuit_breaker: CircuitBreakerManager | None = None,
+    request_path: str | None = None,
 ) -> RequestPlan:
     local_key = _extract_local_key(headers)
     client = config.local_clients_by_key.get(local_key or "")
-    _, requested_model = _parse_request_body(request_body)
+    prepared_request_body = _prepare_request_body_for_forwarding(
+        request_body,
+        request_path=request_path,
+    )
+    _, requested_model = _parse_request_body(prepared_request_body)
     configured_order = list(config.order)
     ordered_upstream_ids = (
         circuit_breaker.prioritized_upstream_ids(config.order)
@@ -2126,7 +2211,7 @@ def plan_request_attempts(
         attempts.append(
             PlannedUpstreamRequest(
                 upstream=upstream,
-                request_body=request_body,
+                request_body=prepared_request_body,
             )
         )
         order_pool.append(
@@ -2201,6 +2286,96 @@ def _parse_request_body(request_body: bytes) -> tuple[dict[str, Any] | None, str
     if not isinstance(model, str) or not model.strip():
         return payload, None
     return payload, model.strip()
+
+
+def _prepare_request_body_for_forwarding(
+    request_body: bytes,
+    *,
+    request_path: str | None,
+) -> bytes:
+    del request_path
+    return request_body
+
+
+def _normalize_request_path(request_path: str | None) -> str:
+    return urlsplit(str(request_path or "")).path.rstrip("/") or "/"
+
+
+def _canonical_json_bytes(payload: Any) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _request_observability_kwargs(request_body: bytes) -> dict[str, Any]:
+    payload, _ = _parse_request_body(request_body)
+    if not isinstance(payload, dict):
+        return {
+            "prompt_cache_key": None,
+            "canonical_body_sha256": None,
+            "stream": None,
+            "reasoning_effort": None,
+        }
+    prompt_cache_key = payload.get("prompt_cache_key")
+    reasoning_effort = None
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if isinstance(effort, str) and effort.strip():
+            reasoning_effort = effort.strip()
+    stream = payload.get("stream") if isinstance(payload.get("stream"), bool) else None
+    return {
+        "prompt_cache_key": prompt_cache_key if isinstance(prompt_cache_key, str) and prompt_cache_key else None,
+        "canonical_body_sha256": hashlib.sha256(_canonical_json_bytes(payload)).hexdigest(),
+        "stream": stream,
+        "reasoning_effort": reasoning_effort,
+    }
+
+
+def _capture_request_body(
+    config: RelayConfig,
+    *,
+    request_trace_id: str,
+    client_id: str | None,
+    request_path: str | None,
+    request_body: bytes,
+    requested_model: str | None,
+) -> None:
+    capture = config.request_body_capture
+    if not capture.enabled or capture.max_captures <= 0:
+        return
+    if capture.client_ids and (client_id or "") not in capture.client_ids:
+        return
+    normalized_path = _normalize_request_path(request_path)
+    if capture.paths and normalized_path not in capture.paths:
+        return
+    try:
+        capture.output_dir.mkdir(parents=True, exist_ok=True)
+        existing_count = sum(1 for _ in capture.output_dir.glob("*.meta.json"))
+        if existing_count >= capture.max_captures:
+            return
+        captured_at = datetime.now(timezone.utc)
+        stamp = captured_at.strftime("%Y%m%dT%H%M%S.%fZ")
+        base_name = f"{stamp}-{request_trace_id}"
+        body_path = capture.output_dir / f"{base_name}.request.json"
+        meta_path = capture.output_dir / f"{base_name}.meta.json"
+        body_path.write_bytes(request_body)
+        metadata = {
+            "request_trace_id": request_trace_id,
+            "captured_at": captured_at.isoformat(),
+            "client_id": client_id,
+            "request_path": normalized_path,
+            "requested_model": requested_model,
+            "request_bytes": len(request_body),
+            "body_sha256": hashlib.sha256(request_body).hexdigest(),
+            "body_file": str(body_path),
+        }
+        meta_path.write_text(_serialize_json(metadata), encoding="utf-8")
+    except Exception as exc:
+        print(f"[relay] request body capture failed: {exc}", file=sys.stderr)
 
 
 def _extract_error_message(content_type: str, body: bytes) -> str:
@@ -2800,7 +2975,11 @@ def _resolve_effective_token_price(
             if builtin_price is not None:
                 return builtin_price, None
             return None, "missing_pricing_config"
-        configured_price = _resolve_token_price(upstream_pricing, requested_model=requested_model)
+        configured_price = _resolve_token_price(
+            pricing,
+            upstream_id=upstream_id,
+            requested_model=requested_model,
+        )
         if configured_price is not None:
             return configured_price, None
         if builtin_price is not None:

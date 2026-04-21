@@ -10,6 +10,8 @@
 - `order`
 - `pricing`（可选，用于覆盖 relay 内置价格表或给私有模型单独定价）
 
+其中 `server.request_body_capture` 也是可选块，用于一次性抓取少量原始 request body 做排障。
+
 目标很直接：
 
 - `local` 只描述本地客户端和它们的 `local_key`
@@ -43,6 +45,33 @@ cp local_api_relay.example.json local_api_relay.json
 - `database_path`
 - `idle_window_seconds`
 - `request_timeout_seconds`
+- `request_body_capture`（可选）
+
+`request_body_capture` 用来做**一次性、小范围**的原始请求抓取，适合排查 `/responses` 真实 body 形状、prompt cache 行为、或者 provider 兼容性问题。
+
+示例：
+
+```json
+{
+  "server": {
+    "request_body_capture": {
+      "enabled": true,
+      "client_ids": ["openclaw"],
+      "paths": ["/responses", "/v1/responses"],
+      "output_dir": "state/request-captures",
+      "max_captures": 1
+    }
+  }
+}
+```
+
+字段含义：
+
+- `enabled`：是否开启抓取
+- `client_ids`：只抓这些本地 client；为空表示不按 client 过滤
+- `paths`：只抓这些路径；为空表示不按路径过滤
+- `output_dir`：抓到的 body 输出目录
+- `max_captures`：最多落多少份；达到上限后自动静默停抓
 
 ### `local`
 
@@ -171,10 +200,17 @@ proxy 请求的最小决策顺序固定如下：
    - 必须 `enabled=true`
    - 最近失败过的 upstream 会被临时降权，恢复窗口过后自动回到基础顺序前排
    - 已经被 breaker 打开的 upstream 会先跳过，等 cooldown 结束后再用 half-open probe 试探恢复
-   - 用同一个 body 原样转发
+   - 默认用同一个 body 原样转发
+   - 如果客户端已经显式带了 `prompt_cache_key`，relay 也原样保留，不覆盖、不改写、不补默认值
    - 只要该 upstream 返回错误响应或请求异常，就继续尝试下一个 upstream
    - 上游成功就立即返回
 6. 全部 upstream 失败后返回聚合错误，列出每个 upstream 的失败摘要
+
+兼容性说明：
+
+- relay **不再自动补** `/responses` 的 `prompt_cache_key`
+- 这样可以避免 relay 自己按整包 request body 派生新 key，从而把 append-only 前缀缓存打散
+- `/responses` 与 `/chat/completions` 现在都遵循同一个保守原则：客户端没带就不补，客户端带了就原样透传
 
 不会再做的事情：
 
@@ -221,6 +257,10 @@ proxy 请求的最小决策顺序固定如下：
 - `request_trace_id`
 - `attempt_index`
 - `terminal_outcome`
+- `prompt_cache_key`（只记录客户端实际发来的值；relay 不再自动生成）
+- `canonical_body_sha256`
+- `stream`
+- `reasoning_effort`
 
 同一次原始请求的所有 attempt 会共享同一个 `request_trace_id`，所以 operator 可以按一次请求稳定还原完整 attempt 链，而不是只能看散落的原始日志行。
 
@@ -536,6 +576,7 @@ curl -s \
 其中：
 
 - `order_pool[]` 会标出这次请求在当时的 effective order 里，哪些 upstream 被 `attempted`、哪些被 `skipped`
+- `attempts[]` 里现在还会带上每次实际记录到库里的 `prompt_cache_key`、`canonical_body_sha256`、`stream`、`reasoning_effort`，方便对账“是不是同一个 key / 同一个规范化请求体”
 - `order_pool[].skip_reason` 目前最少会区分 `disabled` 和 `breaker_open`
 - `traversed_all_planned_attempts=true` 表示这次请求已经把当时所有可尝试 upstream 都走完了；如果同时 `terminal_outcome=fallback_success`，说明它是在最后一跳才救回来
 - `attempts[]` 按 `attempt_index` 顺序列出每一跳的 `upstream_id`、`status_code`、`error_kind`、`upstream_ms` 和该请求的最终 `terminal_outcome`

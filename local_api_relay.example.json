@@ -5,7 +5,14 @@
     "admin_key": "change-me-admin-key",
     "database_path": "state/local_api_relay.sqlite3",
     "idle_window_seconds": 300,
-    "request_timeout_seconds": 120
+    "request_timeout_seconds": 120,
+    "request_body_capture": {
+      "enabled": false,
+      "client_ids": ["openclaw"],
+      "paths": ["/responses", "/v1/responses"],
+      "output_dir": "state/request-captures",
+      "max_captures": 1
+    }
   },
   "local": {
     "clients": [

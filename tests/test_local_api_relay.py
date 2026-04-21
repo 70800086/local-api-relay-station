@@ -396,6 +396,68 @@ class RelayPlanningTests(unittest.TestCase):
         self.assertIsNone(plan.requested_model)
         self.assertEqual([attempt.upstream.upstream_id for attempt in plan.attempts], ["backup"])
 
+    def test_plan_request_attempts_preserves_responses_body_without_auto_prompt_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            payload = make_config_payload(
+                listen_port=8787,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            config = relay.RelayConfig.load(self.write_config(tmp_dir, payload))
+
+        first_request_body = b'{"model":"gpt-5-mini","input":"Reply with: pong","max_output_tokens":16}'
+        second_request_body = b'{\n  "max_output_tokens": 16,\n  "input": "Reply with: pong",\n  "model": "gpt-5-mini"\n}'
+        first_plan = relay.plan_request_attempts(
+            config,
+            headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
+            request_body=first_request_body,
+            request_path="/v1/responses",
+        )
+        second_plan = relay.plan_request_attempts(
+            config,
+            headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
+            request_body=second_request_body,
+            request_path="/responses",
+        )
+
+        self.assertEqual(first_plan.error_status, None)
+        self.assertEqual(second_plan.error_status, None)
+        self.assertEqual(first_plan.attempts[0].request_body, first_request_body)
+        self.assertEqual(second_plan.attempts[0].request_body, second_request_body)
+        self.assertNotIn("prompt_cache_key", json.loads(first_plan.attempts[0].request_body))
+        self.assertNotIn("prompt_cache_key", json.loads(second_plan.attempts[0].request_body))
+
+    def test_plan_request_attempts_preserves_client_prompt_cache_key_for_responses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            payload = make_config_payload(
+                listen_port=8787,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+            )
+            config = relay.RelayConfig.load(self.write_config(tmp_dir, payload))
+
+        request_body = b'{"model":"gpt-5-mini","input":"Reply with: pong","prompt_cache_key":"client-key","max_output_tokens":16}'
+        plan = relay.plan_request_attempts(
+            config,
+            headers={"Authorization": "Bearer local-chat-key", "Content-Type": "application/json"},
+            request_body=request_body,
+            request_path="/v1/responses",
+        )
+
+        self.assertIsNone(plan.error_status)
+        self.assertEqual(plan.attempts[0].request_body, request_body)
+
+    def test_request_observability_kwargs_extracts_prompt_cache_key_stream_reasoning_and_canonical_hash(self) -> None:
+        first = relay._request_observability_kwargs(
+            b'{"model":"gpt-5-mini","input":"Reply with: pong","stream":true,"reasoning":{"effort":"high"},"prompt_cache_key":"client-key","max_output_tokens":16}'
+        )
+        second = relay._request_observability_kwargs(
+            b'{\n  "max_output_tokens": 16,\n  "prompt_cache_key": "client-key",\n  "reasoning": {"effort": "high"},\n  "stream": true,\n  "input": "Reply with: pong",\n  "model": "gpt-5-mini"\n}'
+        )
+
+        self.assertEqual(first["prompt_cache_key"], "client-key")
+        self.assertEqual(first["canonical_body_sha256"], second["canonical_body_sha256"])
+        self.assertTrue(first["stream"])
+        self.assertEqual(first["reasoning_effort"], "high")
+
     def test_plan_request_attempts_rejects_invalid_local_key_and_missing_enabled_upstreams(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             payload = make_config_payload(
@@ -1259,6 +1321,168 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
         config_path = Path(tmp_dir) / "relay-config.json"
         config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return config_path
+
+    def test_responses_requests_preserve_original_body_without_auto_prompt_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+            relay_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                upstream_base_urls={
+                    "primary": f"http://127.0.0.1:{upstream.port}/primary",
+                    "backup": f"http://127.0.0.1:{upstream.port}/backup",
+                },
+            )
+            config_path = self.write_config(tmp_dir, payload)
+            RecordingUpstreamHandler.queue_responses(
+                {
+                    "status": 200,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "X-Upstream-Trace": "stub-1",
+                    },
+                    "body": DEFAULT_RESPONSES_BODY,
+                },
+                {
+                    "status": 200,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "X-Upstream-Trace": "stub-2",
+                    },
+                    "body": DEFAULT_RESPONSES_BODY,
+                },
+            )
+
+            first_request_body = b'{"model":"gpt-5-mini","input":"Reply with: pong","max_output_tokens":16}'
+            second_request_body = b'{\n  "max_output_tokens": 16,\n  "input": "Reply with: pong",\n  "model": "gpt-5-mini"\n}'
+            with RelayServer(config_path):
+                first_status, _, first_response = make_request(
+                    relay_port,
+                    "POST",
+                    "/v1/responses",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=first_request_body,
+                )
+                second_status, _, second_response = make_request(
+                    relay_port,
+                    "POST",
+                    "/v1/responses",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=second_request_body,
+                )
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertEqual(first_response, DEFAULT_RESPONSES_BODY)
+        self.assertEqual(second_response, DEFAULT_RESPONSES_BODY)
+        self.assertEqual(len(RecordingUpstreamHandler.requests), 2)
+        self.assertEqual(RecordingUpstreamHandler.requests[0]["path"], "/primary/v1/responses")
+        self.assertEqual(RecordingUpstreamHandler.requests[1]["path"], "/primary/v1/responses")
+        self.assertEqual(RecordingUpstreamHandler.requests[0]["body"], first_request_body)
+        self.assertEqual(RecordingUpstreamHandler.requests[1]["body"], second_request_body)
+        self.assertNotIn("prompt_cache_key", json.loads(RecordingUpstreamHandler.requests[0]["body"]))
+        self.assertNotIn("prompt_cache_key", json.loads(RecordingUpstreamHandler.requests[1]["body"]))
+
+    def test_responses_requests_preserve_client_prompt_cache_key_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+            relay_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                upstream_base_urls={
+                    "primary": f"http://127.0.0.1:{upstream.port}/primary",
+                    "backup": f"http://127.0.0.1:{upstream.port}/backup",
+                },
+            )
+            config_path = self.write_config(tmp_dir, payload)
+            RecordingUpstreamHandler.queue_responses(
+                {
+                    "status": 200,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "X-Upstream-Trace": "client-key-preserved",
+                    },
+                    "body": DEFAULT_RESPONSES_BODY,
+                }
+            )
+
+            request_body = b'{"model":"gpt-5-mini","input":"Reply with: pong","prompt_cache_key":"client-key","max_output_tokens":16}'
+            with RelayServer(config_path):
+                status, _, response_body = make_request(
+                    relay_port,
+                    "POST",
+                    "/v1/responses",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=request_body,
+                )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response_body, DEFAULT_RESPONSES_BODY)
+        self.assertEqual(len(RecordingUpstreamHandler.requests), 1)
+        self.assertEqual(RecordingUpstreamHandler.requests[0]["path"], "/primary/v1/responses")
+        self.assertEqual(RecordingUpstreamHandler.requests[0]["body"], request_body)
+
+    def test_request_trace_endpoint_includes_request_observability_fields_for_responses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+            relay_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                upstream_base_urls={
+                    "primary": f"http://127.0.0.1:{upstream.port}/primary",
+                    "backup": f"http://127.0.0.1:{upstream.port}/backup",
+                },
+            )
+            config_path = self.write_config(tmp_dir, payload)
+            RecordingUpstreamHandler.queue_responses(
+                {
+                    "status": 200,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "X-Upstream-Trace": "responses-observability",
+                    },
+                    "body": DEFAULT_RESPONSES_BODY,
+                }
+            )
+
+            with RelayServer(config_path):
+                status, headers, response_body = make_request(
+                    relay_port,
+                    "POST",
+                    "/v1/responses",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=b'{"model":"gpt-5-mini","input":"Reply with: pong","max_output_tokens":16,"stream":true,"reasoning":{"effort":"high"},"prompt_cache_key":"client-key"}',
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(response_body, DEFAULT_RESPONSES_BODY)
+                request_trace_id = headers.get("x-relay-request-trace-id")
+                self.assertTrue(request_trace_id)
+
+                trace_status, _, trace_payload = make_request(
+                    relay_port,
+                    "GET",
+                    f"/_relay/request-traces?request_trace_id={request_trace_id}",
+                    headers={"X-Relay-Admin-Key": "relay-admin"},
+                )
+                self.assertEqual(trace_status, 200)
+                trace = json.loads(trace_payload)
+
+        self.assertEqual(trace["attempts"][0]["prompt_cache_key"], "client-key")
+        self.assertTrue(trace["attempts"][0]["stream"])
+        self.assertEqual(trace["attempts"][0]["reasoning_effort"], "high")
+        self.assertTrue(trace["attempts"][0]["canonical_body_sha256"])
 
     def test_request_trace_endpoint_reconstructs_fallback_attempt_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
