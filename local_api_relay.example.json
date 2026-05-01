@@ -22,21 +22,26 @@
       }
     ]
   },
+  "upstream_defaults": {
+    "enabled": true,
+    "default_reasoning_effort": "xhigh",
+    "transport": {
+      "timeout_seconds": 120
+    }
+  },
   "upstreams": {
     "primary-openai": {
       "base_url": "https://api.openai.com/v1",
       "api_key": "sk-primary-upstream-key",
-      "enabled": true,
-      "transport": {
-        "timeout_seconds": 120
-      }
+      "default_model": "gpt-5.4"
     },
     "backup-openai": {
       "base_url": "https://api.openai.com/v1",
       "api_key": "sk-backup-upstream-key",
-      "enabled": true,
+      "default_model": "gpt-5.4-mini",
+      "default_reasoning_effort": "medium",
       "transport": {
-        "timeout_seconds": 120
+        "timeout_seconds": 90
       }
     }
   },

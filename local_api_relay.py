@@ -70,6 +70,16 @@ RESPONSES_FALLBACK_ERROR_MARKERS = (
     "chat/completions",
     "chat completions",
 )
+CHAT_COMPLETIONS_FALLBACK_ERROR_MARKERS = (
+    "chat/completions endpoint not supported",
+    "chat completions endpoint not supported",
+    "chat completions api is not supported",
+    "chat completions are not supported",
+    "unsupported endpoint",
+    "use /responses",
+    "responses endpoint",
+    "responses api",
+)
 NON_TEXT_MODEL_MARKERS = (
     "embedding",
     "moderation",
@@ -120,6 +130,8 @@ class UpstreamConfig:
     api_key: str
     enabled: bool
     transport: dict[str, Any]
+    default_model: str | None = None
+    default_reasoning_effort: str | None = None
 
     def timeout_seconds(self, default: int) -> int:
         try:
@@ -230,7 +242,15 @@ class RelayConfig:
 
         server_payload = _as_dict(payload.get("server"), "server")
         local_payload = _as_dict(payload.get("local"), "local")
-        upstreams_payload = _as_dict(payload.get("upstreams"), "upstreams")
+        upstream_defaults_payload = _as_dict(payload.get("upstream_defaults"), "upstream_defaults")
+        raw_upstreams_payload = _as_dict(payload.get("upstreams"), "upstreams")
+        upstreams_payload = {
+            str(upstream_id): _deep_merge_dicts(
+                upstream_defaults_payload,
+                _as_dict(raw_upstream, f"upstreams.{upstream_id}"),
+            )
+            for upstream_id, raw_upstream in raw_upstreams_payload.items()
+        }
         order_payload = _as_list(payload.get("order"), "order")
 
         local_clients = [
@@ -246,6 +266,14 @@ class RelayConfig:
         upstreams: list[UpstreamConfig] = []
         for upstream_id, raw_upstream in sorted(upstreams_payload.items()):
             upstream_payload = _as_dict(raw_upstream, f"upstreams.{upstream_id}")
+            default_model_raw = upstream_payload.get("default_model")
+            default_model = str(default_model_raw).strip() if isinstance(default_model_raw, str) and default_model_raw.strip() else None
+            default_reasoning_effort_raw = upstream_payload.get("default_reasoning_effort")
+            default_reasoning_effort = (
+                str(default_reasoning_effort_raw).strip()
+                if isinstance(default_reasoning_effort_raw, str) and default_reasoning_effort_raw.strip()
+                else None
+            )
             upstreams.append(
                 UpstreamConfig(
                     upstream_id=str(upstream_id),
@@ -253,6 +281,8 @@ class RelayConfig:
                     api_key=str(upstream_payload["api_key"]),
                     enabled=_as_bool(upstream_payload.get("enabled", True)),
                     transport=_coerce_dict(upstream_payload.get("transport")),
+                    default_model=default_model,
+                    default_reasoning_effort=default_reasoning_effort,
                 )
             )
         _ensure_unique([upstream.upstream_id for upstream in upstreams], "upstream_id")
@@ -1659,10 +1689,18 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 connection: http.client.HTTPConnection | http.client.HTTPSConnection | None = None
                 try:
                     forwarded_headers = _build_upstream_headers(self.headers, attempt.upstream.api_key)
+                    _is_anthropic = _is_anthropic_request(self.path, attempt.request_body)
                     attempt_request_body = attempt.request_body
+                    if _is_anthropic:
+                        # Translate Anthropic→OpenAI, model="default" so _resolve_upstream_model resolves it
+                        attempt_request_body = _translate_anthropic_to_openai(attempt_request_body)
+                        # Override path to OpenAI chat completions endpoint
+                        upstream_path = upstream_path.replace("/v1/messages", "/v1/chat/completions")
+                    attempt_request_body = _resolve_upstream_model(attempt_request_body, attempt.upstream)
                     response_bytes = 0
                     captured_body = b""
                     error_response_body_consumed = False
+                    compatibility_retry_kind: str | None = None
 
                     connection = connection_class(
                         parsed_target.hostname,
@@ -1679,7 +1717,43 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
 
                     if response.status >= 400 and not _is_upgrade_response(self.headers, response):
                         response_bytes, captured_body = _read_full_response_body(response)
-                        error_response_body_consumed = True
+                        compatibility_retry = None if _is_anthropic else _compatibility_retry_request(
+                            request_path=upstream_path,
+                            request_body=attempt_request_body,
+                            status_code=int(response.status),
+                            content_type=response.getheader("Content-Type", ""),
+                            error_body=captured_body,
+                        )
+                        if compatibility_retry is not None:
+                            compatibility_retry_kind = str(compatibility_retry["kind"])
+                            upstream_path = str(compatibility_retry["path"])
+                            attempt_request_body = bytes(compatibility_retry["body"])
+                            attempt_request_body = _resolve_upstream_model(attempt_request_body, attempt.upstream)
+                            connection.close()
+                            connection = connection_class(
+                                parsed_target.hostname,
+                                parsed_target.port,
+                                timeout=attempt.upstream.timeout_seconds(runtime.config.request_timeout_seconds),
+                            )
+                            connection.request(
+                                self.command,
+                                upstream_path,
+                                body=attempt_request_body,
+                                headers=forwarded_headers,
+                            )
+                            response = connection.getresponse()
+                            error_response_body_consumed = False
+                            captured_body = b""
+                            response_bytes = 0
+                            if response.status >= 400 and not _is_upgrade_response(self.headers, response):
+                                response_bytes, captured_body = _read_full_response_body(response)
+                                error_response_body_consumed = True
+                        else:
+                            if _is_anthropic:
+                                captured_body = _translate_openai_to_anthropic(captured_body, response.status, request_id=request_trace_id)
+                                self._send_translated_anthropic_response(response, captured_body)
+                                response_bytes = len(captured_body)
+                            error_response_body_consumed = True
 
                     if response.status < 400 or _is_upgrade_response(self.headers, response):
                         if _is_upgrade_response(self.headers, response):
@@ -1689,12 +1763,21 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                                 runtime.config.request_timeout_seconds,
                             )
                             captured_body = b""
+                        elif _is_anthropic:
+                            response_bytes, captured_body = self._relay_anthropic_response(response, request_trace_id)
+                        elif compatibility_retry_kind == "responses_to_chat_completions":
+                            response_bytes, captured_body = self._relay_chat_completions_as_responses(response, request_trace_id)
+                        elif compatibility_retry_kind == "chat_completions_to_responses":
+                            response_bytes, captured_body = self._relay_responses_as_chat_completions(response, request_trace_id)
                         else:
                             response_bytes, captured_body = self._relay_upstream_response(response)
                         finished_at = datetime.now(timezone.utc)
                         terminal_outcome = "success" if index == 0 else "fallback_success"
+                        usage_content_type = response.getheader("Content-Type", "")
+                        if compatibility_retry_kind is not None:
+                            usage_content_type = "text/event-stream" if "text/event-stream" in response.getheader("Content-Type", "").lower() else "application/json"
                         prompt_tokens, completion_tokens, total_tokens, cached_tokens = _extract_usage_metrics(
-                            response.getheader("Content-Type", ""),
+                            usage_content_type,
                             captured_body,
                         )
                         runtime.usage_store.record_request(
@@ -1928,6 +2011,244 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 if source is upstream_socket:
                     total_bytes += len(chunk)
         return total_bytes
+
+    def _relay_anthropic_response(self, response: http.client.HTTPResponse, request_trace_id: str) -> tuple[int, bytes]:
+        """Read full upstream response, translate to Anthropic format, and send to client."""
+        content_type = response.getheader("Content-Type", "")
+        is_stream = "text/event-stream" in content_type
+        if is_stream:
+            return self._relay_anthropic_stream(response, request_trace_id)
+        total_bytes, raw_body = _read_full_response_body(response)
+        translated_body = _translate_openai_to_anthropic(raw_body, response.status, request_id=request_trace_id)
+        upstream_headers = response.getheaders()
+        filtered_headers: list[tuple[str, str]] = []
+        has_content_type = False
+        for key, value in upstream_headers:
+            lowered = key.lower()
+            if lowered in HOP_BY_HOP_HEADERS:
+                continue
+            if lowered == "content-type":
+                has_content_type = True
+            filtered_headers.append((key, value))
+        if not has_content_type:
+            filtered_headers.append(("Content-Type", "application/json"))
+        bytes_sent = self._relay_buffered_response(
+            response.status,
+            response.reason,
+            filtered_headers,
+            translated_body,
+        )
+        return total_bytes, translated_body
+
+    def _relay_anthropic_stream(self, response: http.client.HTTPResponse, request_trace_id: str) -> tuple[int, bytes]:
+        """Relay streaming response with Anthropic SSE translation."""
+        upstream_headers = response.getheaders()
+        self.send_response(response.status, response.reason)
+        for key, value in upstream_headers:
+            lowered = key.lower()
+            if lowered in HOP_BY_HOP_HEADERS:
+                continue
+            self.send_header(key, value)
+        self._send_request_trace_header()
+        self.end_headers()
+        total_bytes = 0
+        captured = bytearray()
+        buffer = b""
+        while True:
+            chunk = response.read(4096)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            buffer += chunk
+            while b"\n" in buffer:
+                line_bytes, buffer = buffer.split(b"\n", 1)
+                line = line_bytes.decode("utf-8", errors="replace")
+                translated = _translate_openai_stream_to_anthropic_sse(line, request_trace_id)
+                if translated is not None:
+                    out = f"data: {translated}\n\n".encode("utf-8")
+                    self.wfile.write(out)
+                    self.wfile.flush()
+                    if len(captured) < CAPTURE_BODY_LIMIT:
+                        captured.extend(out)
+        # Flush remaining buffer if any
+        if buffer:
+            line = buffer.decode("utf-8", errors="replace")
+            translated = _translate_openai_stream_to_anthropic_sse(line, request_trace_id)
+            if translated is not None:
+                out = f"data: {translated}\n\n".encode("utf-8")
+                self.wfile.write(out)
+                self.wfile.flush()
+                if len(captured) < CAPTURE_BODY_LIMIT:
+                    captured.extend(out)
+        return total_bytes, bytes(captured)
+
+    def _relay_chat_completions_as_responses(
+        self,
+        response: http.client.HTTPResponse,
+        request_trace_id: str,
+    ) -> tuple[int, bytes]:
+        content_type = response.getheader("Content-Type", "")
+        if "text/event-stream" in content_type.lower():
+            return self._relay_chat_completions_stream_as_responses(response, request_trace_id)
+        total_bytes, raw_body = _read_full_response_body(response)
+        translated_body = _translate_chat_completions_json_to_responses(raw_body, request_id=request_trace_id)
+        filtered_headers = self._filtered_response_headers(response.getheaders(), default_content_type="application/json")
+        self._relay_buffered_response(response.status, response.reason, filtered_headers, translated_body)
+        return total_bytes, translated_body
+
+    def _relay_responses_as_chat_completions(
+        self,
+        response: http.client.HTTPResponse,
+        request_trace_id: str,
+    ) -> tuple[int, bytes]:
+        content_type = response.getheader("Content-Type", "")
+        if "text/event-stream" in content_type.lower():
+            return self._relay_responses_stream_as_chat_completions(response, request_trace_id)
+        total_bytes, raw_body = _read_full_response_body(response)
+        translated_body = _translate_responses_json_to_chat_completions(raw_body, request_id=request_trace_id)
+        filtered_headers = self._filtered_response_headers(response.getheaders(), default_content_type="application/json")
+        self._relay_buffered_response(response.status, response.reason, filtered_headers, translated_body)
+        return total_bytes, translated_body
+
+    def _relay_chat_completions_stream_as_responses(
+        self,
+        response: http.client.HTTPResponse,
+        request_trace_id: str,
+    ) -> tuple[int, bytes]:
+        filtered_headers = self._filtered_response_headers(
+            response.getheaders(),
+            default_content_type="text/event-stream; charset=utf-8",
+            force_content_type="text/event-stream; charset=utf-8",
+        )
+        self.send_response(response.status, response.reason)
+        for key, value in filtered_headers:
+            lowered = key.lower()
+            if lowered in HOP_BY_HOP_HEADERS or lowered in {"content-length", "transfer-encoding"}:
+                continue
+            self.send_header(key, value)
+        self.send_header("Transfer-Encoding", "chunked")
+        self._send_request_trace_header()
+        self.end_headers()
+
+        total_bytes = 0
+        captured = bytearray()
+        buffer = b""
+        state = _new_responses_compat_stream_state(request_trace_id)
+        while True:
+            chunk = response.read(4096)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            buffer += chunk
+            while b"\n" in buffer:
+                line_bytes, buffer = buffer.split(b"\n", 1)
+                line = line_bytes.decode("utf-8", errors="replace")
+                for event in _chat_completions_sse_to_responses_events(line, state):
+                    self._write_chunked_bytes(_responses_sse_event_bytes(event), captured)
+        if buffer:
+            line = buffer.decode("utf-8", errors="replace")
+            for event in _chat_completions_sse_to_responses_events(line, state):
+                self._write_chunked_bytes(_responses_sse_event_bytes(event), captured)
+        for event in _finalize_responses_compat_events(state):
+            self._write_chunked_bytes(_responses_sse_event_bytes(event), captured)
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+        return total_bytes, bytes(captured)
+
+    def _relay_responses_stream_as_chat_completions(
+        self,
+        response: http.client.HTTPResponse,
+        request_trace_id: str,
+    ) -> tuple[int, bytes]:
+        filtered_headers = self._filtered_response_headers(
+            response.getheaders(),
+            default_content_type="text/event-stream; charset=utf-8",
+            force_content_type="text/event-stream; charset=utf-8",
+        )
+        self.send_response(response.status, response.reason)
+        for key, value in filtered_headers:
+            lowered = key.lower()
+            if lowered in HOP_BY_HOP_HEADERS or lowered in {"content-length", "transfer-encoding"}:
+                continue
+            self.send_header(key, value)
+        self.send_header("Transfer-Encoding", "chunked")
+        self._send_request_trace_header()
+        self.end_headers()
+
+        total_bytes = 0
+        captured = bytearray()
+        buffer = b""
+        state = _new_chat_completions_compat_stream_state(request_trace_id)
+        while True:
+            chunk = response.read(4096)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            buffer += chunk
+            while b"\n" in buffer:
+                line_bytes, buffer = buffer.split(b"\n", 1)
+                line = line_bytes.decode("utf-8", errors="replace")
+                for event in _responses_sse_to_chat_completions_events(line, state):
+                    self._write_chunked_bytes(_chat_completions_sse_event_bytes(event), captured)
+        if buffer:
+            line = buffer.decode("utf-8", errors="replace")
+            for event in _responses_sse_to_chat_completions_events(line, state):
+                self._write_chunked_bytes(_chat_completions_sse_event_bytes(event), captured)
+        for event in _finalize_chat_completions_compat_events(state):
+            self._write_chunked_bytes(_chat_completions_sse_event_bytes(event), captured)
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+        return total_bytes, bytes(captured)
+
+    def _write_chunked_bytes(self, payload: bytes, captured: bytearray) -> None:
+        if not payload:
+            return
+        self.wfile.write(f"{len(payload):X}\r\n".encode("ascii"))
+        self.wfile.write(payload)
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
+        if len(captured) < CAPTURE_BODY_LIMIT:
+            remaining = CAPTURE_BODY_LIMIT - len(captured)
+            captured.extend(payload[:remaining])
+
+    def _filtered_response_headers(
+        self,
+        upstream_headers: list[tuple[str, str]],
+        *,
+        default_content_type: str,
+        force_content_type: str | None = None,
+    ) -> list[tuple[str, str]]:
+        filtered_headers: list[tuple[str, str]] = []
+        has_content_type = False
+        for key, value in upstream_headers:
+            lowered = key.lower()
+            if lowered in HOP_BY_HOP_HEADERS:
+                continue
+            if lowered == "content-type":
+                has_content_type = True
+                if force_content_type is not None:
+                    continue
+            filtered_headers.append((key, value))
+        if force_content_type is not None:
+            filtered_headers.append(("Content-Type", force_content_type))
+        elif not has_content_type:
+            filtered_headers.append(("Content-Type", default_content_type))
+        return filtered_headers
+
+    def _send_translated_anthropic_response(
+        self, response: http.client.HTTPResponse, translated_body: bytes
+    ) -> int:
+        """Send a pre-translated Anthropic error response."""
+        filtered_headers = self._filtered_response_headers(
+            response.getheaders(),
+            default_content_type="application/json",
+        )
+        return self._relay_buffered_response(
+            response.status,
+            response.reason,
+            filtered_headers,
+            translated_body,
+        )
 
     def _relay_buffered_response(
         self,
@@ -2295,6 +2616,343 @@ def _prepare_request_body_for_forwarding(
 ) -> bytes:
     del request_path
     return request_body
+
+
+def _compatibility_retry_request(
+    *,
+    request_path: str | None,
+    request_body: bytes,
+    status_code: int | None,
+    content_type: str,
+    error_body: bytes,
+) -> dict[str, Any] | None:
+    normalized_path = _normalize_request_path(request_path)
+    error_text = (_extract_error_message(content_type, error_body) or error_body.decode("utf-8", errors="replace")).lower()
+
+    if _is_responses_request_path(normalized_path):
+        if not _requires_chat_fallback(status_code=status_code, error_text=error_text):
+            return None
+        translated_body = _responses_request_to_chat_completions_body(request_body)
+        if translated_body is None:
+            return None
+        return {
+            "kind": "responses_to_chat_completions",
+            "path": _responses_path_to_chat_completions_path(str(request_path or DEFAULT_RESPONSES_PATH)),
+            "body": translated_body,
+        }
+
+    if _is_chat_completions_request_path(normalized_path):
+        if not _requires_responses_fallback(status_code=status_code, error_text=error_text):
+            return None
+        translated_body = _chat_completions_request_to_responses_body(request_body)
+        if translated_body is None:
+            return None
+        return {
+            "kind": "chat_completions_to_responses",
+            "path": _chat_completions_path_to_responses_path(str(request_path or DEFAULT_CHAT_COMPLETIONS_PATH)),
+            "body": translated_body,
+        }
+
+    return None
+
+
+def _is_responses_request_path(request_path: str | None) -> bool:
+    normalized_path = _normalize_request_path(request_path)
+    return normalized_path.endswith(DEFAULT_RESPONSES_PATH) or normalized_path.endswith(f"/v1{DEFAULT_RESPONSES_PATH}")
+
+
+def _is_chat_completions_request_path(request_path: str | None) -> bool:
+    normalized_path = _normalize_request_path(request_path)
+    return normalized_path.endswith(DEFAULT_CHAT_COMPLETIONS_PATH) or normalized_path.endswith(f"/v1{DEFAULT_CHAT_COMPLETIONS_PATH}")
+
+
+def _responses_path_to_chat_completions_path(request_path: str) -> str:
+    parsed = urlsplit(request_path)
+    path = parsed.path or "/"
+    if path.endswith(DEFAULT_RESPONSES_PATH):
+        path = f"{path[:-len(DEFAULT_RESPONSES_PATH)]}{DEFAULT_CHAT_COMPLETIONS_PATH}"
+    return urlunsplit(("", "", path, parsed.query, ""))
+
+
+def _chat_completions_path_to_responses_path(request_path: str) -> str:
+    parsed = urlsplit(request_path)
+    path = parsed.path or "/"
+    if path.endswith(DEFAULT_CHAT_COMPLETIONS_PATH):
+        path = f"{path[:-len(DEFAULT_CHAT_COMPLETIONS_PATH)]}{DEFAULT_RESPONSES_PATH}"
+    return urlunsplit(("", "", path, parsed.query, ""))
+
+
+def _responses_request_to_chat_completions_body(request_body: bytes) -> bytes | None:
+    payload, _ = _parse_request_body(request_body)
+    if not isinstance(payload, dict):
+        return None
+
+    messages = _responses_input_to_chat_messages(payload.get("input"))
+    instructions = payload.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        messages.insert(0, {"role": "system", "content": instructions.strip()})
+    if not messages:
+        return None
+
+    translated: dict[str, Any] = {
+        "model": payload.get("model", "default"),
+        "messages": messages,
+    }
+
+    passthrough_keys = (
+        "stream",
+        "temperature",
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "response_format",
+        "stop",
+        "seed",
+        "metadata",
+        "user",
+    )
+    for key in passthrough_keys:
+        if key in payload:
+            translated[key] = payload[key]
+
+    max_output_tokens = payload.get("max_output_tokens")
+    if max_output_tokens is not None:
+        translated["max_tokens"] = max_output_tokens
+
+    return _canonical_json_bytes(translated)
+
+
+def _responses_input_to_chat_messages(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [{"role": "user", "content": text}] if text else []
+    if isinstance(value, dict):
+        message = _responses_input_item_to_chat_message(value)
+        return [message] if message is not None else []
+    if not isinstance(value, list):
+        return []
+    messages: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                messages.append({"role": "user", "content": text})
+            continue
+        if not isinstance(item, dict):
+            continue
+        message = _responses_input_item_to_chat_message(item)
+        if message is not None:
+            messages.append(message)
+    return messages
+
+
+def _responses_input_item_to_chat_message(item: dict[str, Any]) -> dict[str, Any] | None:
+    role = item.get("role")
+    if not isinstance(role, str) or not role.strip():
+        if item.get("type") in {"input_text", "text"} and isinstance(item.get("text"), str):
+            text = item["text"].strip()
+            return {"role": "user", "content": text} if text else None
+        return None
+    content = _responses_content_to_chat_content(item.get("content"))
+    if content is None:
+        text = str(item.get("text") or "").strip()
+        if not text:
+            return None
+        content = text
+    return {"role": role.strip(), "content": content}
+
+
+def _responses_content_to_chat_content(value: Any) -> str | list[dict[str, Any]] | None:
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if not isinstance(value, list):
+        return None
+    parts: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type in {"input_text", "output_text", "text"}:
+            text = str(item.get("text") or "").strip()
+            if text:
+                text_parts.append(text)
+                parts.append({"type": "text", "text": text})
+            continue
+        if item_type in {"input_image", "image_url"}:
+            image_url = item.get("image_url")
+            if isinstance(image_url, dict):
+                image_url = image_url.get("url")
+            if image_url is None:
+                image_url = item.get("url")
+            if isinstance(image_url, str) and image_url.strip():
+                parts.append({"type": "image_url", "image_url": {"url": image_url.strip()}})
+    if not parts:
+        return None
+    if all(part.get("type") == "text" for part in parts):
+        combined = "\n".join(text_parts).strip()
+        return combined or None
+    return parts
+
+
+def _chat_completions_request_to_responses_body(request_body: bytes) -> bytes | None:
+    payload, _ = _parse_request_body(request_body)
+    if not isinstance(payload, dict):
+        return None
+
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list):
+        return None
+
+    input_items: list[dict[str, Any]] = []
+    instructions_parts: list[str] = []
+    for message in raw_messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip()
+        if not role:
+            continue
+        if role == "system":
+            content = _chat_content_to_responses_content(message.get("content"))
+            instruction_text = _responses_content_to_instruction_text(content)
+            if instruction_text:
+                instructions_parts.append(instruction_text)
+            continue
+        translated_message = _chat_message_to_responses_input_item(message)
+        if translated_message is not None:
+            input_items.append(translated_message)
+
+    if not input_items:
+        return None
+
+    translated: dict[str, Any] = {
+        "model": payload.get("model", "default"),
+        "input": input_items,
+    }
+    if instructions_parts:
+        translated["instructions"] = "\n\n".join(instructions_parts)
+
+    passthrough_keys = (
+        "stream",
+        "temperature",
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "response_format",
+        "stop",
+        "seed",
+        "metadata",
+        "user",
+    )
+    for key in passthrough_keys:
+        if key in payload:
+            translated[key] = payload[key]
+
+    max_tokens = payload.get("max_tokens")
+    if max_tokens is not None:
+        translated["max_output_tokens"] = max_tokens
+
+    return _canonical_json_bytes(translated)
+
+
+def _chat_message_to_responses_input_item(message: dict[str, Any]) -> dict[str, Any] | None:
+    role = str(message.get("role") or "").strip()
+    if not role:
+        return None
+    content = _chat_content_to_responses_content(message.get("content"))
+    if content is None:
+        return None
+    return {"role": role, "content": content}
+
+
+def _chat_content_to_responses_content(value: Any) -> list[dict[str, Any]] | None:
+    if isinstance(value, str):
+        text = value.strip()
+        return [{"type": "input_text", "text": text}] if text else None
+    if not isinstance(value, list):
+        return None
+    parts: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                parts.append({"type": "input_text", "text": text})
+            continue
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type == "text":
+            text = str(item.get("text") or "").strip()
+            if text:
+                parts.append({"type": "input_text", "text": text})
+            continue
+        if item_type == "image_url":
+            image_url = item.get("image_url")
+            if isinstance(image_url, dict):
+                url = image_url.get("url")
+                detail = image_url.get("detail")
+            else:
+                url = image_url
+                detail = None
+            if isinstance(url, str) and url.strip():
+                part: dict[str, Any] = {"type": "input_image", "image_url": url.strip()}
+                if isinstance(detail, str) and detail.strip():
+                    part["detail"] = detail.strip()
+                parts.append(part)
+    return parts or None
+
+
+def _responses_content_to_instruction_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if not isinstance(value, list):
+        return None
+    parts: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts) if parts else None
+
+
+def _resolve_upstream_model(request_body: bytes, upstream: UpstreamConfig) -> bytes:
+    payload, model = _parse_request_body(request_body)
+    if not isinstance(payload, dict):
+        return request_body
+
+    changed = False
+    if upstream.default_model and model == "default":
+        payload["model"] = upstream.default_model
+        changed = True
+
+    reasoning = payload.get("reasoning")
+    if (
+        upstream.default_reasoning_effort
+        and isinstance(reasoning, dict)
+        and isinstance(reasoning.get("effort"), str)
+        and reasoning.get("effort", "").strip() == "default"
+    ):
+        payload["reasoning"] = dict(reasoning)
+        payload["reasoning"]["effort"] = upstream.default_reasoning_effort
+        changed = True
+
+    if not changed:
+        return request_body
+    return json.dumps(payload).encode("utf-8")
 
 
 def _normalize_request_path(request_path: str | None) -> str:
@@ -3097,6 +3755,18 @@ def _coerce_dict(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("expected object")
     return value
+
+
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {str(key): value for key, value in base.items()}
+    for key, value in override.items():
+        normalized_key = str(key)
+        existing = merged.get(normalized_key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[normalized_key] = _deep_merge_dicts(existing, value)
+            continue
+        merged[normalized_key] = value
+    return merged
 
 
 def _load_pricing_catalog(
@@ -3957,6 +4627,14 @@ def _compatibility_retry_plan(attempt: dict[str, Any], *, model: str) -> dict[st
             "path": _request_path_for_mode(fallback_mode),
             "body": _request_body_for_mode(model=model, mode=fallback_mode),
         }
+    if mode == "chat.completions" and _requires_responses_fallback(status_code=status_code, error_text=error_text):
+        fallback_mode = "responses"
+        return {
+            "kind": "chat_completions_to_responses",
+            "mode": fallback_mode,
+            "path": _request_path_for_mode(fallback_mode),
+            "body": _request_body_for_mode(model=model, mode=fallback_mode),
+        }
     return None
 
 
@@ -3970,6 +4648,14 @@ def _requires_chat_fallback(*, status_code: int | None, error_text: str) -> bool
     if status_code not in {400, 422}:
         return False
     return any(marker in error_text for marker in RESPONSES_FALLBACK_ERROR_MARKERS)
+
+
+def _requires_responses_fallback(*, status_code: int | None, error_text: str) -> bool:
+    if status_code in UNSUPPORTED_ENDPOINT_STATUS_CODES:
+        return True
+    if status_code not in {400, 422}:
+        return False
+    return any(marker in error_text for marker in CHAT_COMPLETIONS_FALLBACK_ERROR_MARKERS)
 
 
 def _skipped_request_result(error_kind: str) -> dict[str, Any]:
@@ -4212,6 +4898,391 @@ def _extract_stream_delta_text(payload: Any) -> str | None:
     return "".join(parts) if parts else None
 
 
+def _translate_chat_completions_json_to_responses(body: bytes, *, request_id: str) -> bytes:
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+    if not isinstance(payload, dict):
+        return body
+    translated = _chat_completions_payload_to_responses_payload(payload, request_id=request_id)
+    return json.dumps(translated, ensure_ascii=False).encode("utf-8")
+
+
+def _chat_completions_payload_to_responses_payload(payload: dict[str, Any], *, request_id: str) -> dict[str, Any]:
+    response_id = str(payload.get("id") or request_id)
+    model = str(payload.get("model") or "")
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        choices = []
+    choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    output_text = _extract_message_content(message) or str(message.get("reasoning_content") or "").strip()
+    usage = _chat_completions_usage_to_responses_usage(payload.get("usage"))
+    content = []
+    if output_text:
+        content.append({"type": "output_text", "text": output_text, "annotations": []})
+    response_payload: dict[str, Any] = {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": model,
+        "output": [
+            {
+                "id": f"msg_{response_id}",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": content,
+            }
+        ],
+    }
+    if usage is not None:
+        response_payload["usage"] = usage
+    if output_text:
+        response_payload["output_text"] = output_text
+    return response_payload
+
+
+def _chat_completions_usage_to_responses_usage(usage: Any) -> dict[str, Any] | None:
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = _coerce_optional_int(usage.get("prompt_tokens"))
+    output_tokens = _coerce_optional_int(usage.get("completion_tokens"))
+    total_tokens = _coerce_optional_int(usage.get("total_tokens"))
+    if input_tokens is None and output_tokens is None and total_tokens is None:
+        return None
+    payload: dict[str, Any] = {
+        "input_tokens": int(input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+        "total_tokens": int(total_tokens or ((input_tokens or 0) + (output_tokens or 0))),
+    }
+    cached_tokens = _extract_cached_tokens(usage)
+    if cached_tokens is not None:
+        payload["input_tokens_details"] = {"cached_tokens": int(cached_tokens)}
+    return payload
+
+
+def _new_responses_compat_stream_state(request_id: str) -> dict[str, Any]:
+    response_id = request_id or uuid.uuid4().hex
+    return {
+        "request_id": request_id,
+        "response_id": response_id,
+        "item_id": f"msg_{response_id}",
+        "model": "",
+        "text_parts": [],
+        "usage": None,
+        "started": False,
+        "completed": False,
+        "finish_reason": None,
+    }
+
+
+def _chat_completions_sse_to_responses_events(line: str, state: dict[str, Any]) -> list[dict[str, Any] | str]:
+    if not line.startswith("data:"):
+        return []
+    data = line[5:].strip()
+    if not data or data == "[DONE]":
+        return []
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+
+    response_id = payload.get("id")
+    if isinstance(response_id, str) and response_id.strip():
+        state["response_id"] = response_id.strip()
+        state["item_id"] = f"msg_{state['response_id']}"
+    model = payload.get("model")
+    if isinstance(model, str) and model.strip():
+        state["model"] = model.strip()
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        state["usage"] = usage
+
+    events: list[dict[str, Any] | str] = []
+    if not state["started"]:
+        events.extend(_initial_responses_compat_events(state))
+        state["started"] = True
+
+    delta_text = _extract_stream_delta_text(payload)
+    if delta_text:
+        state["text_parts"].append(delta_text)
+        events.append(
+            {
+                "type": "response.output_text.delta",
+                "item_id": state["item_id"],
+                "output_index": 0,
+                "content_index": 0,
+                "delta": delta_text,
+            }
+        )
+
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None:
+            state["finish_reason"] = str(finish_reason)
+    return events
+
+
+def _finalize_responses_compat_events(state: dict[str, Any]) -> list[dict[str, Any] | str]:
+    if state.get("completed"):
+        return []
+    if not state.get("started"):
+        state["started"] = True
+        initial_events = _initial_responses_compat_events(state)
+    else:
+        initial_events = []
+    output_text = "".join(str(part) for part in state.get("text_parts", []))
+    part = {"type": "output_text", "text": output_text, "annotations": []}
+    final_payload = _chat_completions_payload_to_responses_payload(
+        {
+            "id": state["response_id"],
+            "model": state.get("model") or "",
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": output_text},
+                    "finish_reason": state.get("finish_reason") or "stop",
+                }
+            ],
+            "usage": state.get("usage") or {},
+        },
+        request_id=str(state.get("request_id") or state.get("response_id") or uuid.uuid4().hex),
+    )
+    state["completed"] = True
+    return [
+        *initial_events,
+        {
+            "type": "response.output_text.done",
+            "item_id": state["item_id"],
+            "output_index": 0,
+            "content_index": 0,
+            "text": output_text,
+        },
+        {
+            "type": "response.content_part.done",
+            "item_id": state["item_id"],
+            "output_index": 0,
+            "content_index": 0,
+            "part": part,
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": final_payload["output"][0],
+        },
+        {
+            "type": "response.completed",
+            "response": final_payload,
+        },
+        "[DONE]",
+    ]
+
+
+def _initial_responses_compat_events(state: dict[str, Any]) -> list[dict[str, Any]]:
+    response_id = str(state.get("response_id") or uuid.uuid4().hex)
+    item_id = str(state.get("item_id") or f"msg_{response_id}")
+    model = str(state.get("model") or "")
+    response_stub = {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "in_progress",
+        "model": model,
+        "output": [],
+    }
+    item = {
+        "id": item_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "in_progress",
+        "content": [],
+    }
+    return [
+        {"type": "response.created", "response": dict(response_stub)},
+        {"type": "response.in_progress", "response": dict(response_stub)},
+        {"type": "response.output_item.added", "output_index": 0, "item": dict(item)},
+        {
+            "type": "response.content_part.added",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []},
+        },
+    ]
+
+
+def _responses_sse_event_bytes(event: dict[str, Any] | str) -> bytes:
+    if event == "[DONE]":
+        return b"data: [DONE]\n\n"
+    return f"data: {_serialize_json(event)}\n\n".encode("utf-8")
+
+
+def _translate_responses_json_to_chat_completions(body: bytes, *, request_id: str) -> bytes:
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+    if not isinstance(payload, dict):
+        return body
+    translated = _responses_payload_to_chat_completions_payload(payload, request_id=request_id)
+    return json.dumps(translated, ensure_ascii=False).encode("utf-8")
+
+
+def _responses_payload_to_chat_completions_payload(payload: dict[str, Any], *, request_id: str) -> dict[str, Any]:
+    response_id = str(payload.get("id") or request_id)
+    model = str(payload.get("model") or "")
+    output_text = _extract_reply_preview(payload) or ""
+    message: dict[str, Any] = {"role": "assistant", "content": output_text}
+    chat_payload: dict[str, Any] = {
+        "id": response_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    usage = _responses_usage_to_chat_completions_usage(payload.get("usage"))
+    if usage is not None:
+        chat_payload["usage"] = usage
+    return chat_payload
+
+
+def _responses_usage_to_chat_completions_usage(usage: Any) -> dict[str, Any] | None:
+    if not isinstance(usage, dict):
+        return None
+    prompt_tokens = _coerce_optional_int(usage.get("input_tokens"))
+    completion_tokens = _coerce_optional_int(usage.get("output_tokens"))
+    total_tokens = _coerce_optional_int(usage.get("total_tokens"))
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+    payload: dict[str, Any] = {
+        "prompt_tokens": int(prompt_tokens or 0),
+        "completion_tokens": int(completion_tokens or 0),
+        "total_tokens": int(total_tokens or ((prompt_tokens or 0) + (completion_tokens or 0))),
+    }
+    input_details = usage.get("input_tokens_details")
+    if isinstance(input_details, dict):
+        cached_tokens = _coerce_optional_int(input_details.get("cached_tokens"))
+        if cached_tokens is not None:
+            payload["prompt_tokens_details"] = {"cached_tokens": int(cached_tokens)}
+    return payload
+
+
+def _new_chat_completions_compat_stream_state(request_id: str) -> dict[str, Any]:
+    response_id = request_id or uuid.uuid4().hex
+    return {
+        "request_id": request_id,
+        "response_id": response_id,
+        "model": "",
+        "usage": None,
+        "text_parts": [],
+        "completed": False,
+        "finish_reason": "stop",
+    }
+
+
+def _responses_sse_to_chat_completions_events(line: str, state: dict[str, Any]) -> list[dict[str, Any] | str]:
+    if not line.startswith("data:"):
+        return []
+    data = line[5:].strip()
+    if not data or data == "[DONE]":
+        return []
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+
+    event_type = str(payload.get("type") or "")
+    events: list[dict[str, Any] | str] = []
+    if event_type == "response.output_text.delta":
+        delta = payload.get("delta")
+        if isinstance(delta, str) and delta:
+            state["text_parts"].append(delta)
+            events.append(_chat_completion_chunk_payload(state, delta=delta, finish_reason=None))
+        return events
+
+    if event_type == "response.completed":
+        response_payload = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+        response_id = response_payload.get("id")
+        if isinstance(response_id, str) and response_id.strip():
+            state["response_id"] = response_id.strip()
+        model = response_payload.get("model")
+        if isinstance(model, str) and model.strip():
+            state["model"] = model.strip()
+        usage = response_payload.get("usage")
+        if isinstance(usage, dict):
+            state["usage"] = usage
+        output_text = _extract_reply_preview(response_payload) or ""
+        existing_text = "".join(str(part) for part in state.get("text_parts", []))
+        if output_text.startswith(existing_text):
+            remainder = output_text[len(existing_text):]
+        else:
+            remainder = output_text
+        if remainder:
+            state["text_parts"].append(remainder)
+            events.append(_chat_completion_chunk_payload(state, delta=remainder, finish_reason=None))
+        events.extend(_finalize_chat_completions_compat_events(state))
+        return events
+
+    return []
+
+
+def _finalize_chat_completions_compat_events(state: dict[str, Any]) -> list[dict[str, Any] | str]:
+    if state.get("completed"):
+        return []
+    state["completed"] = True
+    return [
+        _chat_completion_chunk_payload(state, delta="", finish_reason=str(state.get("finish_reason") or "stop"), include_usage=True),
+        "[DONE]",
+    ]
+
+
+def _chat_completion_chunk_payload(
+    state: dict[str, Any],
+    *,
+    delta: str,
+    finish_reason: str | None,
+    include_usage: bool = False,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": str(state.get("response_id") or state.get("request_id") or uuid.uuid4().hex),
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": str(state.get("model") or ""),
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": delta},
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    if include_usage:
+        usage = _responses_usage_to_chat_completions_usage(state.get("usage"))
+        if usage is not None:
+            payload["usage"] = usage
+    return payload
+
+
+def _chat_completions_sse_event_bytes(event: dict[str, Any] | str) -> bytes:
+    if event == "[DONE]":
+        return b"data: [DONE]\n\n"
+    return f"data: {_serialize_json(event)}\n\n".encode("utf-8")
+
+
 def _extract_model_ids(payload: Any) -> list[str]:
     if isinstance(payload, dict):
         data = payload.get("data")
@@ -4448,6 +5519,190 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False))
         return 0
     raise ValueError(f"unsupported command: {args.command}")
+
+
+# ── Anthropic ↔ OpenAI API translation ──────────────────────────
+
+ANTHROPIC_MESSAGES_PATH = "/v1/messages"
+
+
+def _is_anthropic_request(path: str, body: bytes) -> bool:
+    """Check if this is an Anthropic Messages API request."""
+    if not path.rstrip("/").endswith(ANTHROPIC_MESSAGES_PATH):
+        return False
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return isinstance(payload, dict) and "messages" in payload and "model" in payload
+
+
+def _translate_anthropic_to_openai(body: bytes) -> bytes:
+    """Convert Anthropic Messages API request to OpenAI Chat Completions."""
+    payload = json.loads(body.decode("utf-8"))
+    model = payload.get("model", "claude-sonnet-4-20250514")
+    max_tokens = payload.get("max_tokens", 4096)
+    system_prompt = payload.get("system", "")
+    messages = payload.get("messages", [])
+    stream = payload.get("stream", False)
+    temperature = payload.get("temperature")
+    top_p = payload.get("top_p")
+    stop_sequences = payload.get("stop_sequences")
+
+    openai_messages = []
+    if system_prompt:
+        if isinstance(system_prompt, str):
+            openai_messages.append({"role": "system", "content": system_prompt})
+        elif isinstance(system_prompt, list):
+            texts = []
+            for block in system_prompt:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    texts.append(str(block.get("text", "")))
+            if texts:
+                openai_messages.append({"role": "system", "content": " ".join(texts)})
+
+    for msg in messages:
+        role = str(msg.get("role", "user"))
+        if role not in ("user", "assistant", "system"):
+            role = "user"
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+                elif block.get("type") == "image":
+                    source = block.get("source", {})
+                    if isinstance(source, dict):
+                        parts.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{source.get('media_type', 'image/jpeg')};base64,{source.get('data', '')}"
+                            }
+                        })
+            if parts and all(isinstance(p, str) for p in parts):
+                content = " ".join(parts)
+            else:
+                content = parts if parts else ""
+        openai_messages.append({"role": role, "content": content})
+
+    openai_body: dict[str, Any] = {
+        "model": "default",
+        "messages": openai_messages,
+        "max_tokens": max_tokens,
+        "stream": stream,
+    }
+    if temperature is not None:
+        openai_body["temperature"] = float(temperature)
+    if top_p is not None:
+        openai_body["top_p"] = float(top_p)
+    if stop_sequences:
+        openai_body["stop"] = stop_sequences if isinstance(stop_sequences, list) else [stop_sequences]
+    return json.dumps(openai_body, ensure_ascii=False).encode("utf-8")
+
+
+def _translate_openai_to_anthropic(body: bytes, status_code: int, *, request_id: str = "") -> bytes:
+    """Convert OpenAI Chat Completions response to Anthropic Messages API format."""
+    if status_code >= 400:
+        try:
+            error_payload = json.loads(body.decode("utf-8"))
+            error_msg = (
+                error_payload.get("error", {}).get("message", "")
+                if isinstance(error_payload.get("error"), dict)
+                else str(error_payload)
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            error_msg = body.decode("utf-8", errors="replace")[:500]
+        anthropic_error = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": error_msg or "upstream error",
+            },
+        }
+        return json.dumps(anthropic_error, ensure_ascii=False).encode("utf-8")
+
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+
+    if not isinstance(payload, dict):
+        return body
+
+    model = str(payload.get("model", ""))
+    usage = payload.get("usage", {}) if isinstance(payload.get("usage"), dict) else {}
+    choices = payload.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        return body
+
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message", {}) if isinstance(choice.get("message"), dict) else {}
+    finish_reason = str(choice.get("finish_reason", "stop") or "stop")
+
+    content_text = message.get("content") or message.get("reasoning_content") or ""
+
+    stop_reason_map = {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "tool_calls": "tool_use",
+        "content_filter": "end_turn",
+    }
+
+    response_id = str(payload.get("id", request_id))
+    anthropic_response = {
+        "id": f"msg_{response_id}" if response_id else f"msg_{request_id}",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": str(content_text)}],
+        "model": model,
+        "stop_reason": stop_reason_map.get(finish_reason, finish_reason),
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": int(usage.get("prompt_tokens", 0)),
+            "output_tokens": int(usage.get("completion_tokens", 0)),
+        },
+    }
+    return json.dumps(anthropic_response, ensure_ascii=False).encode("utf-8")
+
+
+def _translate_openai_stream_to_anthropic_sse(line: str, request_id: str) -> str | None:
+    """Convert one OpenAI SSE stream line to Anthropic SSE format.
+
+    Returns None if the line should be skipped."""
+    if not line.startswith("data: "):
+        return line
+    data_str = line[6:].strip()
+    if data_str == "[DONE]":
+        return "data: [DONE]"
+    try:
+        chunk = json.loads(data_str)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(chunk, dict):
+        return None
+    choices = chunk.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    delta = choice.get("delta", {}) if isinstance(choice.get("delta"), dict) else {}
+    content = delta.get("content") or delta.get("reasoning_content")
+    finish_reason = choice.get("finish_reason")
+    # Skip empty/whitespace-only content chunks
+    if content and str(content).strip():
+        return json.dumps({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": str(content)},
+        }, ensure_ascii=False)
+    if finish_reason:
+        return json.dumps({
+            "type": "message_delta",
+            "delta": {"stop_reason": str(finish_reason)},
+        }, ensure_ascii=False)
+    return None
 
 
 if __name__ == "__main__":

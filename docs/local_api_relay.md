@@ -100,27 +100,60 @@ cp local_api_relay.example.json local_api_relay.json
 - `local_key` 是本地客户端实际拿来访问 relay 的 key
 - 这里不再出现 route、policy、model group 之类概念
 
-### `upstreams`
+### `upstream_defaults`
 
-上游注册表按 upstream id 建对象：
+可选。给所有 upstream 提供一个公共默认配置，实际加载时会和每个 `upstreams.<id>` 做**递归合并**：
+
+- 标量字段：每个 upstream 自己的值覆盖公共默认值
+- 对象字段：逐层合并，例如 `transport.timeout_seconds`
+- 列表字段：直接整体覆盖，不做拼接
 
 ```json
 {
+  "upstream_defaults": {
+    "enabled": true,
+    "default_reasoning_effort": "xhigh",
+    "transport": {
+      "timeout_seconds": 120
+    }
+  }
+}
+```
+
+这层抽象**不局限于模型和推理强度**，而是对整个 upstream 配置对象生效；现在 relay 会消费到的典型字段包括：
+
+- `enabled`
+- `default_model`
+- `default_reasoning_effort`
+- `transport`
+- `pricing`
+- 以及以后新增的 upstream 级字段
+
+### `upstreams`
+
+上游注册表按 upstream id 建对象。每个 upstream 会在加载时继承 `upstream_defaults`，然后再用自己的字段覆盖：
+
+```json
+{
+  "upstream_defaults": {
+    "enabled": true,
+    "default_reasoning_effort": "xhigh",
+    "transport": {
+      "timeout_seconds": 120
+    }
+  },
   "upstreams": {
     "shenfeng": {
       "base_url": "http://23.144.68.54:8080/v1",
       "api_key": "sk-your-upstream-key",
-      "enabled": true,
-      "transport": {
-        "timeout_seconds": 120
-      }
+      "default_model": "gpt-5.4"
     },
     "codexFor": {
       "base_url": "https://api-vip.codex-for.me/v1",
       "api_key": "clp-your-upstream-key",
-      "enabled": true,
+      "default_reasoning_effort": "medium",
       "transport": {
-        "timeout_seconds": 120
+        "timeout_seconds": 90
       }
     }
   }
@@ -132,6 +165,11 @@ cp local_api_relay.example.json local_api_relay.json
 - `base_url`
 - `api_key`
 - `enabled`
+- `default_model`
+  - 当请求里的 `model` 为 `"default"` 时，relay 会在发往该 upstream 前解析成这里的值。
+- `default_reasoning_effort`
+  - 当请求里的 `reasoning.effort` 为 `"default"` 时，relay 会在发往该 upstream 前解析成这里的值。
+  - 如果公共配置和源级配置都未设置，relay 不会强行改写，会上游自己决定如何处理 `default`。
 - `transport`
   - 目前只使用 `timeout_seconds`
 
