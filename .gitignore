@@ -1,23 +1,12 @@
-stock-score/
-out/
-tmp/
-
 # Python cache
 __pycache__/
 *.pyc
 .pytest_cache/
 
-# Runtime / local state
+# Runtime state
 state/
-.openclaw/
-.learnings/
+out/
+tmp/
+
+# Secrets - contains API keys
 local_api_relay.json
-
-# Personal memory and local notes
-MEMORY.md
-USER.md
-memory/
-
-# Local tooling noise
-.clawhub/
-skills/.skills_store_lock.json

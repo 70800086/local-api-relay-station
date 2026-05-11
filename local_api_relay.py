@@ -132,6 +132,8 @@ class UpstreamConfig:
     transport: dict[str, Any]
     default_model: str | None = None
     default_reasoning_effort: str | None = None
+    request_format: str | None = None
+    model_aliases: dict[str, str] = field(default_factory=dict)
 
     def timeout_seconds(self, default: int) -> int:
         try:
@@ -274,6 +276,13 @@ class RelayConfig:
                 if isinstance(default_reasoning_effort_raw, str) and default_reasoning_effort_raw.strip()
                 else None
             )
+            request_format = _normalize_request_format(upstream_payload.get("request_format"))
+            raw_model_aliases = _coerce_dict(upstream_payload.get("model_aliases"))
+            model_aliases = {
+                str(source).strip(): str(target).strip()
+                for source, target in raw_model_aliases.items()
+                if str(source).strip() and str(target).strip()
+            }
             upstreams.append(
                 UpstreamConfig(
                     upstream_id=str(upstream_id),
@@ -283,6 +292,8 @@ class RelayConfig:
                     transport=_coerce_dict(upstream_payload.get("transport")),
                     default_model=default_model,
                     default_reasoning_effort=default_reasoning_effort,
+                    request_format=request_format,
+                    model_aliases=model_aliases,
                 )
             )
         _ensure_unique([upstream.upstream_id for upstream in upstreams], "upstream_id")
@@ -1691,16 +1702,22 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                     forwarded_headers = _build_upstream_headers(self.headers, attempt.upstream.api_key)
                     _is_anthropic = _is_anthropic_request(self.path, attempt.request_body)
                     attempt_request_body = attempt.request_body
+                    response_translation_kind: str | None = None
                     if _is_anthropic:
                         # Translate Anthropic→OpenAI, model="default" so _resolve_upstream_model resolves it
                         attempt_request_body = _translate_anthropic_to_openai(attempt_request_body)
                         # Override path to OpenAI chat completions endpoint
                         upstream_path = upstream_path.replace("/v1/messages", "/v1/chat/completions")
+                    else:
+                        upstream_path, attempt_request_body, response_translation_kind = _prepare_upstream_request_for_forwarding(
+                            request_path=upstream_path,
+                            request_body=attempt_request_body,
+                            upstream=attempt.upstream,
+                        )
                     attempt_request_body = _resolve_upstream_model(attempt_request_body, attempt.upstream)
                     response_bytes = 0
                     captured_body = b""
                     error_response_body_consumed = False
-                    compatibility_retry_kind: str | None = None
 
                     connection = connection_class(
                         parsed_target.hostname,
@@ -1723,9 +1740,12 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             status_code=int(response.status),
                             content_type=response.getheader("Content-Type", ""),
                             error_body=captured_body,
+                            allow_endpoint_flip=response_translation_kind is None,
                         )
                         if compatibility_retry is not None:
-                            compatibility_retry_kind = str(compatibility_retry["kind"])
+                            retry_kind = str(compatibility_retry["kind"])
+                            if retry_kind in {"responses_to_chat_completions", "chat_completions_to_responses"}:
+                                response_translation_kind = retry_kind
                             upstream_path = str(compatibility_retry["path"])
                             attempt_request_body = bytes(compatibility_retry["body"])
                             attempt_request_body = _resolve_upstream_model(attempt_request_body, attempt.upstream)
@@ -1755,6 +1775,67 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                                 response_bytes = len(captured_body)
                             error_response_body_consumed = True
 
+                    # Pre-read JSON response body to detect empty chat completions
+                    _json_pre_read_body: bytes | None = None
+                    _json_ct = response.getheader("Content-Type", "")
+                    if (
+                        response.status < 400
+                        and not _is_upgrade_response(self.headers, response)
+                        and not _is_anthropic
+                        and response_translation_kind is None
+                        and "application/json" in _json_ct
+                        and "text/event-stream" not in _json_ct
+                    ):
+                        _, _json_pre_read_body = _read_full_response_body(response)
+                        error_response_body_consumed = True
+                        if _is_empty_chat_response_body(_json_pre_read_body) and index + 1 < len(plan.attempts):
+                            # Treat empty chat response as upstream failure → fall back
+                            response_bytes = len(_json_pre_read_body)
+                            captured_body = _json_pre_read_body
+                            prompt_tokens, completion_tokens, total_tokens, cached_tokens = (
+                                _extract_usage_metrics(_json_ct, captured_body)
+                            )
+                            attempt_failures.append(
+                                UpstreamAttemptFailure(
+                                    upstream_id=attempt.upstream.upstream_id,
+                                    error_kind="empty_response_body",
+                                    status_code=int(response.status),
+                                    reason="Empty chat completions response body",
+                                    message="Upstream returned HTTP 200 with empty/invalid body",
+                                )
+                            )
+                            runtime.usage_store.record_request(
+                                started_at=attempt_started_at,
+                                finished_at=datetime.now(timezone.utc),
+                                client_id=client_id,
+                                upstream_id=attempt.upstream.upstream_id,
+                                request_trace_id=request_trace_id,
+                                attempt_index=index,
+                                requested_model=plan.requested_model,
+                                method=self.command,
+                                path=self.path,
+                                status_code=int(response.status),
+                                forwarded=True,
+                                request_bytes=len(attempt_request_body),
+                                response_bytes=response_bytes,
+                                upstream_ms=_duration_ms(attempt_started_at, datetime.now(timezone.utc)),
+                                error_kind="empty_response_body_fallback",
+                                terminal_outcome=None,
+                                routing_snapshot_json=routing_snapshot_json,
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                total_tokens=total_tokens,
+                                cached_tokens=cached_tokens,
+                                **_request_observability_kwargs(attempt_request_body),
+                            )
+                            breaker_lease.mark_soft_failure(
+                                error_kind="empty_response_body",
+                                status_code=int(response.status),
+                                reason="Empty chat completions response body",
+                            )
+                            connection.close()
+                            continue
+
                     if response.status < 400 or _is_upgrade_response(self.headers, response):
                         if _is_upgrade_response(self.headers, response):
                             response_bytes = self._relay_upstream_upgrade(
@@ -1765,16 +1846,18 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                             captured_body = b""
                         elif _is_anthropic:
                             response_bytes, captured_body = self._relay_anthropic_response(response, request_trace_id)
-                        elif compatibility_retry_kind == "responses_to_chat_completions":
+                        elif response_translation_kind == "responses_to_chat_completions":
                             response_bytes, captured_body = self._relay_chat_completions_as_responses(response, request_trace_id)
-                        elif compatibility_retry_kind == "chat_completions_to_responses":
+                        elif response_translation_kind == "chat_completions_to_responses":
                             response_bytes, captured_body = self._relay_responses_as_chat_completions(response, request_trace_id)
+                        elif _json_pre_read_body is not None:
+                            response_bytes, captured_body = self._send_buffered_upstream_response(response, _json_pre_read_body)
                         else:
                             response_bytes, captured_body = self._relay_upstream_response(response)
                         finished_at = datetime.now(timezone.utc)
                         terminal_outcome = "success" if index == 0 else "fallback_success"
                         usage_content_type = response.getheader("Content-Type", "")
-                        if compatibility_retry_kind is not None:
+                        if response_translation_kind is not None:
                             usage_content_type = "text/event-stream" if "text/event-stream" in response.getheader("Content-Type", "").lower() else "application/json"
                         prompt_tokens, completion_tokens, total_tokens, cached_tokens = _extract_usage_metrics(
                             usage_content_type,
@@ -1969,6 +2052,32 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
         return total_bytes, bytes(captured)
 
+    def _send_buffered_upstream_response(
+        self, response: http.client.HTTPResponse, body: bytes
+    ) -> tuple[int, bytes]:
+        """Send a pre-read upstream response body to the client.
+        Used when the body was already consumed for validation."""
+        upstream_headers = response.getheaders()
+        content_length = len(body)
+        self.send_response(response.status, response.reason)
+        for key, value in upstream_headers:
+            normalized_key = key.lower()
+            if normalized_key in HOP_BY_HOP_HEADERS:
+                continue
+            if normalized_key == "transfer-encoding":
+                continue
+            if normalized_key == "content-length":
+                self.send_header(key, str(content_length))
+                continue
+            self.send_header(key, value)
+        if not any(h.lower() == "content-length" for h, _ in upstream_headers):
+            self.send_header("Content-Length", str(content_length))
+        self._send_request_trace_header()
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        return content_length, body
+
     def _relay_upstream_upgrade(
         self,
         connection: http.client.HTTPConnection | http.client.HTTPSConnection,
@@ -2089,10 +2198,31 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
     ) -> tuple[int, bytes]:
         content_type = response.getheader("Content-Type", "")
         if "text/event-stream" in content_type.lower():
-            return self._relay_chat_completions_stream_as_responses(response, request_trace_id)
+            first_chunk = response.read(4096)
+            if _looks_like_json_payload(first_chunk):
+                tail_bytes, tail_body = _read_full_response_body(response)
+                raw_body = first_chunk + tail_body
+                translated_body = _translate_chat_completions_json_to_responses(raw_body, request_id=request_trace_id)
+                filtered_headers = self._filtered_response_headers(
+                    response.getheaders(),
+                    default_content_type="application/json",
+                    force_content_type="application/json",
+                )
+                self._relay_buffered_response(response.status, response.reason, filtered_headers, translated_body)
+                return len(first_chunk) + tail_bytes, translated_body
+            return self._relay_chat_completions_stream_as_responses(
+                response,
+                request_trace_id,
+                initial_chunk=first_chunk,
+                initial_bytes=len(first_chunk),
+            )
         total_bytes, raw_body = _read_full_response_body(response)
         translated_body = _translate_chat_completions_json_to_responses(raw_body, request_id=request_trace_id)
-        filtered_headers = self._filtered_response_headers(response.getheaders(), default_content_type="application/json")
+        filtered_headers = self._filtered_response_headers(
+            response.getheaders(),
+            default_content_type="application/json",
+            force_content_type="application/json",
+        )
         self._relay_buffered_response(response.status, response.reason, filtered_headers, translated_body)
         return total_bytes, translated_body
 
@@ -2103,10 +2233,31 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
     ) -> tuple[int, bytes]:
         content_type = response.getheader("Content-Type", "")
         if "text/event-stream" in content_type.lower():
-            return self._relay_responses_stream_as_chat_completions(response, request_trace_id)
+            first_chunk = response.read(4096)
+            if _looks_like_json_payload(first_chunk):
+                tail_bytes, tail_body = _read_full_response_body(response)
+                raw_body = first_chunk + tail_body
+                translated_body = _translate_responses_json_to_chat_completions(raw_body, request_id=request_trace_id)
+                filtered_headers = self._filtered_response_headers(
+                    response.getheaders(),
+                    default_content_type="application/json",
+                    force_content_type="application/json",
+                )
+                self._relay_buffered_response(response.status, response.reason, filtered_headers, translated_body)
+                return len(first_chunk) + tail_bytes, translated_body
+            return self._relay_responses_stream_as_chat_completions(
+                response,
+                request_trace_id,
+                initial_chunk=first_chunk,
+                initial_bytes=len(first_chunk),
+            )
         total_bytes, raw_body = _read_full_response_body(response)
         translated_body = _translate_responses_json_to_chat_completions(raw_body, request_id=request_trace_id)
-        filtered_headers = self._filtered_response_headers(response.getheaders(), default_content_type="application/json")
+        filtered_headers = self._filtered_response_headers(
+            response.getheaders(),
+            default_content_type="application/json",
+            force_content_type="application/json",
+        )
         self._relay_buffered_response(response.status, response.reason, filtered_headers, translated_body)
         return total_bytes, translated_body
 
@@ -2114,6 +2265,9 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         self,
         response: http.client.HTTPResponse,
         request_trace_id: str,
+        *,
+        initial_chunk: bytes = b"",
+        initial_bytes: int = 0,
     ) -> tuple[int, bytes]:
         filtered_headers = self._filtered_response_headers(
             response.getheaders(),
@@ -2130,21 +2284,21 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         self._send_request_trace_header()
         self.end_headers()
 
-        total_bytes = 0
+        total_bytes = initial_bytes
         captured = bytearray()
-        buffer = b""
+        buffer = initial_chunk
         state = _new_responses_compat_stream_state(request_trace_id)
         while True:
-            chunk = response.read(4096)
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-            buffer += chunk
             while b"\n" in buffer:
                 line_bytes, buffer = buffer.split(b"\n", 1)
                 line = line_bytes.decode("utf-8", errors="replace")
                 for event in _chat_completions_sse_to_responses_events(line, state):
                     self._write_chunked_bytes(_responses_sse_event_bytes(event), captured)
+            chunk = response.read(4096)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            buffer += chunk
         if buffer:
             line = buffer.decode("utf-8", errors="replace")
             for event in _chat_completions_sse_to_responses_events(line, state):
@@ -2159,6 +2313,9 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         self,
         response: http.client.HTTPResponse,
         request_trace_id: str,
+        *,
+        initial_chunk: bytes = b"",
+        initial_bytes: int = 0,
     ) -> tuple[int, bytes]:
         filtered_headers = self._filtered_response_headers(
             response.getheaders(),
@@ -2175,21 +2332,21 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         self._send_request_trace_header()
         self.end_headers()
 
-        total_bytes = 0
+        total_bytes = initial_bytes
         captured = bytearray()
-        buffer = b""
+        buffer = initial_chunk
         state = _new_chat_completions_compat_stream_state(request_trace_id)
         while True:
-            chunk = response.read(4096)
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-            buffer += chunk
             while b"\n" in buffer:
                 line_bytes, buffer = buffer.split(b"\n", 1)
                 line = line_bytes.decode("utf-8", errors="replace")
                 for event in _responses_sse_to_chat_completions_events(line, state):
                     self._write_chunked_bytes(_chat_completions_sse_event_bytes(event), captured)
+            chunk = response.read(4096)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            buffer += chunk
         if buffer:
             line = buffer.decode("utf-8", errors="replace")
             for event in _responses_sse_to_chat_completions_events(line, state):
@@ -2594,6 +2751,38 @@ def _should_trip_circuit_breaker(status_code: int) -> bool:
     return status_code >= 500 or status_code in {408, 409, 425, 429}
 
 
+def _is_empty_chat_response_body(body: bytes) -> bool:
+    """Detect chat completions / responses endpoint JSON body that is
+    effectively empty (no assistant content)."""
+    if not body:
+        return True
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    choices = payload.get("choices")
+    if isinstance(choices, list):
+        if len(choices) == 0:
+            return True
+        first = choices[0]
+        if isinstance(first, dict):
+            msg = first.get("message") or first.get("delta")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if content is None or (isinstance(content, str) and content.strip() == ""):
+                    return True
+            elif msg is None and first.get("finish_reason") is None:
+                return True
+    output = payload.get("output")
+    if isinstance(output, list) and len(output) == 0:
+        return True
+    if isinstance(output, dict) and not output:
+        return True
+    return False
+
+
 def _parse_request_body(request_body: bytes) -> tuple[dict[str, Any] | None, str | None]:
     if not request_body:
         return None, None
@@ -2625,11 +2814,12 @@ def _compatibility_retry_request(
     status_code: int | None,
     content_type: str,
     error_body: bytes,
+    allow_endpoint_flip: bool = True,
 ) -> dict[str, Any] | None:
     normalized_path = _normalize_request_path(request_path)
     error_text = (_extract_error_message(content_type, error_body) or error_body.decode("utf-8", errors="replace")).lower()
 
-    if _is_responses_request_path(normalized_path):
+    if allow_endpoint_flip and _is_responses_request_path(normalized_path):
         if not _requires_chat_fallback(status_code=status_code, error_text=error_text):
             return None
         translated_body = _responses_request_to_chat_completions_body(request_body)
@@ -2641,7 +2831,7 @@ def _compatibility_retry_request(
             "body": translated_body,
         }
 
-    if _is_chat_completions_request_path(normalized_path):
+    if allow_endpoint_flip and _is_chat_completions_request_path(normalized_path):
         if not _requires_responses_fallback(status_code=status_code, error_text=error_text):
             return None
         translated_body = _chat_completions_request_to_responses_body(request_body)
@@ -2705,7 +2895,6 @@ def _responses_request_to_chat_completions_body(request_body: bytes) -> bytes | 
         "top_p",
         "presence_penalty",
         "frequency_penalty",
-        "tools",
         "tool_choice",
         "parallel_tool_calls",
         "response_format",
@@ -2717,6 +2906,10 @@ def _responses_request_to_chat_completions_body(request_body: bytes) -> bytes | 
     for key in passthrough_keys:
         if key in payload:
             translated[key] = payload[key]
+
+    tools = _responses_tools_to_chat_tools(payload.get("tools"))
+    if tools is not None:
+        translated["tools"] = tools
 
     max_output_tokens = payload.get("max_output_tokens")
     if max_output_tokens is not None:
@@ -2752,6 +2945,12 @@ def _responses_input_to_chat_messages(value: Any) -> list[dict[str, Any]]:
 
 
 def _responses_input_item_to_chat_message(item: dict[str, Any]) -> dict[str, Any] | None:
+    item_type = str(item.get("type") or "")
+    if item_type == "function_call":
+        return _responses_function_call_to_chat_message(item)
+    if item_type == "function_call_output":
+        return _responses_function_call_output_to_chat_message(item)
+
     role = item.get("role")
     if not isinstance(role, str) or not role.strip():
         if item.get("type") in {"input_text", "text"} and isinstance(item.get("text"), str):
@@ -2764,7 +2963,72 @@ def _responses_input_item_to_chat_message(item: dict[str, Any]) -> dict[str, Any
         if not text:
             return None
         content = text
-    return {"role": role.strip(), "content": content}
+    return {"role": _responses_role_to_chat_role(role.strip()), "content": content}
+
+
+def _responses_role_to_chat_role(role: str) -> str:
+    if role == "developer":
+        return "system"
+    return role
+
+
+def _responses_function_call_to_chat_message(item: dict[str, Any]) -> dict[str, Any] | None:
+    call_id = str(item.get("call_id") or item.get("id") or "").strip()
+    name = str(item.get("name") or "").strip()
+    if not call_id or not name:
+        return None
+    arguments = item.get("arguments")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            }
+        ],
+    }
+
+
+def _responses_function_call_output_to_chat_message(item: dict[str, Any]) -> dict[str, Any] | None:
+    call_id = str(item.get("call_id") or "").strip()
+    if not call_id:
+        return None
+    output = item.get("output")
+    if not isinstance(output, str):
+        output = json.dumps(output if output is not None else "", ensure_ascii=False)
+    return {"role": "tool", "tool_call_id": call_id, "content": output}
+
+
+def _responses_tools_to_chat_tools(value: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(value, list):
+        return None
+    tools: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "function":
+            tools.append(dict(item))
+            continue
+        function_payload = item.get("function")
+        if isinstance(function_payload, dict):
+            tools.append({"type": "function", "function": dict(function_payload)})
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        function_payload = {"name": name}
+        for key in ("description", "parameters", "strict"):
+            if key in item:
+                function_payload[key] = item[key]
+        tools.append({"type": "function", "function": function_payload})
+    return tools or None
 
 
 def _responses_content_to_chat_content(value: Any) -> str | list[dict[str, Any]] | None:
@@ -2935,8 +3199,9 @@ def _resolve_upstream_model(request_body: bytes, upstream: UpstreamConfig) -> by
         return request_body
 
     changed = False
-    if upstream.default_model and model == "default":
-        payload["model"] = upstream.default_model
+    resolved_model = _resolve_upstream_model_name(model, upstream)
+    if resolved_model is not None and resolved_model != model:
+        payload["model"] = resolved_model
         changed = True
 
     reasoning = payload.get("reasoning")
@@ -2953,6 +3218,63 @@ def _resolve_upstream_model(request_body: bytes, upstream: UpstreamConfig) -> by
     if not changed:
         return request_body
     return json.dumps(payload).encode("utf-8")
+
+
+def _resolve_upstream_model_name(model: str | None, upstream: UpstreamConfig) -> str | None:
+    if model is None:
+        return None
+    resolved = model
+    if resolved == "default" and upstream.default_model:
+        resolved = upstream.default_model
+    if resolved in upstream.model_aliases:
+        return upstream.model_aliases[resolved]
+    if "*" in upstream.model_aliases:
+        return upstream.model_aliases["*"]
+    return resolved
+
+
+def _prepare_upstream_request_for_forwarding(
+    *,
+    request_path: str | None,
+    request_body: bytes,
+    upstream: UpstreamConfig,
+) -> tuple[str, bytes, str | None]:
+    normalized_path = _normalize_request_path(request_path)
+    request_format = upstream.request_format
+    if request_format == "chat.completions" and _is_responses_request_path(normalized_path):
+        translated_body = _responses_request_to_chat_completions_body(request_body)
+        if translated_body is not None:
+            return (
+                _responses_path_to_chat_completions_path(str(request_path or DEFAULT_RESPONSES_PATH)),
+                translated_body,
+                "responses_to_chat_completions",
+            )
+    if request_format == "responses" and _is_chat_completions_request_path(normalized_path):
+        translated_body = _chat_completions_request_to_responses_body(request_body)
+        if translated_body is not None:
+            return (
+                _chat_completions_path_to_responses_path(str(request_path or DEFAULT_CHAT_COMPLETIONS_PATH)),
+                translated_body,
+                "chat_completions_to_responses",
+            )
+    return str(request_path or ""), request_body, None
+
+
+def _normalize_request_format(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower().replace("_", ".").replace("-", ".")
+    if not normalized:
+        return None
+    aliases = {
+        "responses": "responses",
+        "response": "responses",
+        "chat.completions": "chat.completions",
+        "chat.completion": "chat.completions",
+        "chatcompletions": "chat.completions",
+        "chat": "chat.completions",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def _normalize_request_path(request_path: str | None) -> str:
@@ -4828,6 +5150,10 @@ def _parse_response_payload(payload: bytes) -> Any | None:
         return _parse_sse_payload(payload)
 
 
+def _looks_like_json_payload(payload: bytes) -> bool:
+    return payload.lstrip().startswith((b"{", b"["))
+
+
 def _parse_sse_payload(payload: bytes) -> dict[str, Any] | None:
     try:
         decoded = payload.decode("utf-8")
@@ -4890,6 +5216,19 @@ def _extract_stream_delta_text(payload: Any) -> str | None:
             continue
         if isinstance(content, list):
             for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+            if parts:
+                continue
+        reasoning_content = delta.get("reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content:
+            parts.append(reasoning_content)
+            continue
+        if isinstance(reasoning_content, list):
+            for item in reasoning_content:
                 if not isinstance(item, dict):
                     continue
                 text = item.get("text")
@@ -5009,6 +5348,13 @@ def _chat_completions_sse_to_responses_events(line: str, state: dict[str, Any]) 
         state["started"] = True
 
     delta_text = _extract_stream_delta_text(payload)
+    if not delta_text:
+        preview_text = _extract_reply_preview(payload) or ""
+        existing_text = "".join(str(part) for part in state.get("text_parts", []))
+        if preview_text.startswith(existing_text):
+            delta_text = preview_text[len(existing_text):]
+        else:
+            delta_text = preview_text
     if delta_text:
         state["text_parts"].append(delta_text)
         events.append(

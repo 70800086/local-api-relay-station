@@ -2203,6 +2203,102 @@ class RelayResponsesCompatibilityTests(unittest.TestCase):
         self.assertIn('"output_text":"pong"', text)
         self.assertTrue(text.rstrip().endswith("data: [DONE]"))
 
+    def test_chat_completions_stream_translates_reasoning_content_to_responses_events(self) -> None:
+        state = relay._new_responses_compat_stream_state("trace_123")
+        first_events = relay._chat_completions_sse_to_responses_events(
+            'data: {"id":"chatcmpl_1","model":"deepseek-v4-pro","choices":[{"delta":{"reasoning_content":"pondered"},"finish_reason":null}]}',
+            state,
+        )
+        final_events = relay._finalize_responses_compat_events(state)
+        encoded = b"".join(relay._responses_sse_event_bytes(event) for event in [*first_events, *final_events])
+        text = encoded.decode("utf-8")
+        self.assertIn('"delta":"pondered"', text)
+        self.assertIn('"output_text":"pondered"', text)
+        self.assertTrue(text.rstrip().endswith("data: [DONE]"))
+
+    def test_chat_completions_stream_translates_message_content_to_responses_events(self) -> None:
+        state = relay._new_responses_compat_stream_state("trace_123")
+        first_events = relay._chat_completions_sse_to_responses_events(
+            'data: {"id":"chatcmpl_1","model":"deepseek-v4-pro","choices":[{"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}]}',
+            state,
+        )
+        final_events = relay._finalize_responses_compat_events(state)
+        encoded = b"".join(relay._responses_sse_event_bytes(event) for event in [*first_events, *final_events])
+        text = encoded.decode("utf-8")
+        self.assertIn('"delta":"pong"', text)
+        self.assertIn('"output_text":"pong"', text)
+        self.assertTrue(text.rstrip().endswith("data: [DONE]"))
+
+    def test_responses_request_translates_tool_turns_to_chat_completions_shape(self) -> None:
+        translated = relay._responses_request_to_chat_completions_body(
+            json.dumps(
+                {
+                    "model": "default",
+                    "input": [
+                        {"role": "developer", "content": "be brief"},
+                        {"role": "user", "content": [{"type": "input_text", "text": "read it"}]},
+                        {
+                            "type": "function_call",
+                            "call_id": "call_123",
+                            "name": "read",
+                            "arguments": "{\"path\":\"README.md\"}",
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_123",
+                            "output": "file contents",
+                        },
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "read",
+                            "description": "Read a file",
+                            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                            "strict": False,
+                        }
+                    ],
+                    "stream": True,
+                }
+            ).encode("utf-8")
+        )
+
+        self.assertIsNotNone(translated)
+        payload = json.loads(translated or b"{}")
+        self.assertEqual(
+            payload["messages"],
+            [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "read it"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_123", "content": "file contents"},
+            ],
+        )
+        self.assertEqual(
+            payload["tools"],
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read a file",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                        "strict": False,
+                    },
+                }
+            ],
+        )
+
     def test_responses_stream_translates_to_chat_completions_events(self) -> None:
         state = relay._new_chat_completions_compat_stream_state("trace_456")
         first_events = relay._responses_sse_to_chat_completions_events(
@@ -2365,6 +2461,140 @@ class RelayResponsesCompatibilityTests(unittest.TestCase):
         self.assertEqual(retry_payload["max_output_tokens"], 16)
         self.assertTrue(retry_payload["stream"])
 
+    def test_proxy_applies_configured_request_format_and_model_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+            relay_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                upstream_base_urls={
+                    "primary": f"http://127.0.0.1:{upstream.port}/deepseek",
+                    "backup": f"http://127.0.0.1:{upstream.port}/unused",
+                },
+            )
+            payload["upstreams"] = {
+                "deepseek": {
+                    "base_url": f"http://127.0.0.1:{upstream.port}/deepseek",
+                    "api_key": "upstream-deepseek-key",
+                    "enabled": True,
+                    "request_format": "chat.completions",
+                    "default_model": "deepseek-v4-pro",
+                    "model_aliases": {"*": "deepseek-v4-pro"},
+                    "transport": {"timeout_seconds": 120},
+                }
+            }
+            payload["order"] = ["deepseek"]
+            config_path = Path(tmp_dir) / "relay-config.json"
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with RelayServer(config_path):
+                status, _, response_body = make_request(
+                    relay_port,
+                    "POST",
+                    "/v1/responses",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=json.dumps(
+                        {
+                            "model": "gpt-5.5",
+                            "input": "Reply with: pong",
+                            "max_output_tokens": 16,
+                        }
+                    ).encode("utf-8"),
+                )
+
+        self.assertEqual(status, 201)
+        self.assertEqual(len(RecordingUpstreamHandler.requests), 1)
+        self.assertEqual(RecordingUpstreamHandler.requests[0]["path"], "/deepseek/v1/chat/completions")
+        upstream_payload = json.loads(RecordingUpstreamHandler.requests[0]["body"])
+        self.assertEqual(upstream_payload["model"], "deepseek-v4-pro")
+        self.assertEqual(upstream_payload["messages"], [{"role": "user", "content": "Reply with: pong"}])
+        self.assertEqual(upstream_payload["max_tokens"], 16)
+        translated_response = json.loads(response_body)
+        self.assertEqual(translated_response["object"], "response")
+        self.assertEqual(translated_response["output_text"], "ok")
+
+    def test_proxy_treats_event_stream_header_with_json_body_as_json_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+            relay_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                upstream_base_urls={
+                    "primary": f"http://127.0.0.1:{upstream.port}/primary",
+                    "backup": f"http://127.0.0.1:{upstream.port}/unused",
+                },
+            )
+            payload["upstreams"] = {
+                "gptcodex": {
+                    "base_url": f"http://127.0.0.1:{upstream.port}/primary",
+                    "api_key": "upstream-gptcodex-key",
+                    "enabled": True,
+                    "request_format": "chat.completions",
+                    "default_model": "gpt-5.5",
+                    "model_aliases": {"default": "gpt-5.5", "gpt-5.5": "gpt-5.5"},
+                    "transport": {"timeout_seconds": 120},
+                }
+            }
+            payload["order"] = ["gptcodex"]
+            config_path = Path(tmp_dir) / "relay-config.json"
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+            RecordingUpstreamHandler.queue_responses(
+                {
+                    "status": 200,
+                    "headers": {
+                        "Content-Type": "text/event-stream",
+                    },
+                    "body": json.dumps(
+                        {
+                            "id": "resp_123",
+                            "object": "chat.completion",
+                            "model": "gpt-5.5",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": "pong"},
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                            "usage": {
+                                "prompt_tokens": 21,
+                                "completion_tokens": 5,
+                                "total_tokens": 26,
+                            },
+                        }
+                    ).encode("utf-8"),
+                }
+            )
+
+            with RelayServer(config_path):
+                status, headers, response_body = make_request(
+                    relay_port,
+                    "POST",
+                    "/responses",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=json.dumps(
+                        {
+                            "model": "default",
+                            "input": "Reply with: pong",
+                            "max_output_tokens": 16,
+                        }
+                    ).encode("utf-8"),
+                )
+
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", headers.get("content-type", ""))
+        translated_response = json.loads(response_body)
+        self.assertEqual(translated_response["output_text"], "pong")
+        self.assertEqual(translated_response["usage"]["input_tokens"], 21)
+        self.assertEqual(len(RecordingUpstreamHandler.requests), 1)
+        self.assertEqual(RecordingUpstreamHandler.requests[0]["path"], "/primary/chat/completions")
+
 
 class RelayDefaultModelTests(unittest.TestCase):
     def test_resolve_upstream_model_no_default_model_returns_unchanged(self) -> None:
@@ -2495,6 +2725,39 @@ class RelayDefaultModelTests(unittest.TestCase):
             self.assertEqual(upstream_a.default_reasoning_effort, "high")
             self.assertIsNone(upstream_b.default_model)
             self.assertIsNone(upstream_b.default_reasoning_effort)
+        finally:
+            config_path.unlink(missing_ok=True)
+
+    def test_config_parses_request_format_and_model_aliases_from_upstream(self) -> None:
+        config_json = json.dumps({
+            "server": {},
+            "local": {"clients": []},
+            "upstreams": {
+                "provider-a": {
+                    "base_url": "https://a.example.com/v1",
+                    "api_key": "sk-a",
+                    "request_format": "chat.completions",
+                    "model_aliases": {"*": "deepseek-v4-pro"},
+                },
+                "provider-b": {
+                    "base_url": "https://b.example.com/v1",
+                    "api_key": "sk-b",
+                    "request_format": "responses",
+                    "model_aliases": {"gpt-5.5": "gpt-5.4"},
+                },
+            },
+            "order": ["provider-a", "provider-b"],
+        })
+        config_path = Path(tempfile.mkdtemp()) / "relay-config.json"
+        config_path.write_text(config_json)
+        try:
+            config = relay.RelayConfig.load(str(config_path))
+            upstream_a = config.upstreams_by_id["provider-a"]
+            upstream_b = config.upstreams_by_id["provider-b"]
+            self.assertEqual(upstream_a.request_format, "chat.completions")
+            self.assertEqual(upstream_a.model_aliases["*"], "deepseek-v4-pro")
+            self.assertEqual(upstream_b.request_format, "responses")
+            self.assertEqual(upstream_b.model_aliases["gpt-5.5"], "gpt-5.4")
         finally:
             config_path.unlink(missing_ok=True)
 
