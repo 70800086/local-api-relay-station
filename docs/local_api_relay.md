@@ -2,10 +2,11 @@
 
 这版是最终最简结构。
 
-顶层正式接口现在有五个 key：
+顶层正式接口现在有六个 key：
 
 - `server`
 - `local`
+- `upstream_defaults`（可选，用于减少每个 upstream 的重复默认配置）
 - `upstreams`
 - `order`
 - `pricing`（可选，用于覆盖 relay 内置价格表或给私有模型单独定价）
@@ -15,6 +16,7 @@
 目标很直接：
 
 - `local` 只描述本地客户端和它们的 `local_key`
+- `upstream_defaults` 只描述所有上游共享的默认配置
 - `upstreams` 只描述真实上游和上游 key
 - `order` 决定 relay 对所有代理请求按什么顺序尝试上游
 - `pricing` 提供 relay 自身 stats 的显式覆盖口径；如果不配，relay 会回落到内置热门模型价格表
@@ -185,6 +187,16 @@ cp local_api_relay.example.json local_api_relay.json
 
 relay 会严格按这个顺序尝试。
 
+如果希望少维护一份 upstream id，也可以写：
+
+```json
+{
+  "order": "configured"
+}
+```
+
+这表示按 `upstreams` 对象里的声明顺序尝试。需要把路由顺序和上游注册表分开审阅时，仍建议使用显式数组。
+
 ### `pricing`
 
 可选。relay 现在自带一份 `relay_model_pricing.json`，内置了 OpenAI / Anthropic / Gemini 的热门模型价格与来源。
@@ -194,22 +206,25 @@ relay 会严格按这个顺序尝试。
 {
   "pricing": {
     "currency": "USD",
+    "default": {
+      "input_per_million_tokens": 0.5,
+      "cached_input_per_million_tokens": 0.05,
+      "output_per_million_tokens": 1.5
+    },
+    "models": {
+      "gpt-5.4-mini": {
+        "input_per_million_tokens": 0.25,
+        "cached_input_per_million_tokens": 0.025,
+        "output_per_million_tokens": 1.0
+      }
+    },
+    "upstream_defaults": {
+      "cached_input_per_million_tokens": 0.06
+    },
     "upstreams": {
-      "shenfeng": {
-        "input_per_million_tokens": 0.5,
-        "cached_input_per_million_tokens": 0.05,
-        "output_per_million_tokens": 1.5,
-        "models": {
-          "gpt-5.4-mini": {
-            "input_per_million_tokens": 0.25,
-            "cached_input_per_million_tokens": 0.025,
-            "output_per_million_tokens": 1.0
-          }
-        }
-      },
+      "shenfeng": {},
       "codexFor": {
         "input_per_million_tokens": 0.6,
-        "cached_input_per_million_tokens": 0.06,
         "output_per_million_tokens": 1.8
       }
     }
@@ -220,10 +235,13 @@ relay 会严格按这个顺序尝试。
 规则：
 
 - `currency` 是 relay stats 里 `estimated_cost.currency` 的统一货币单位
-- `upstreams.<id>` 对应一个 upstream 的默认单价
+- `default` 是所有 upstream 都可共用的显式默认单价；老的顶层 `input_per_million_tokens` / `output_per_million_tokens` 写法仍兼容，但同时存在时以 `default` 为准
+- `models.<model>` 是所有 upstream 共用的模型单价覆盖
+- `upstream_defaults` 会递归合并到每个已声明的 `upstreams.<id>` pricing 项，用来减少源级重复字段
+- `upstreams.<id>` 对应一个 upstream 的默认单价，并可覆盖 `upstream_defaults`
 - `upstreams.<id>.models.<model>` 可以覆盖某个模型在这个 upstream 下的单价
 - `cached_input_per_million_tokens` 可选；如果请求日志里有 `cached_tokens` 且单价存在，relay 会把这部分单独计入 `estimated_cost.cached_input`
-- relay 的价格命中顺序是：`显式 upstream/model pricing` -> `显式 upstream 默认 pricing` -> `内置热门模型价格表`
+- relay 的价格命中顺序是：`显式 upstream/model pricing` -> `显式 upstream 默认 pricing` -> `显式全局 model pricing` -> `显式全局 default pricing` -> `内置热门模型价格表`
 - 如果显式配置和内置表都没命中，或者只有 `total_tokens` 没有 `prompt_tokens/completion_tokens`，该请求不会计入 `estimated_cost`
 
 ## 请求行为

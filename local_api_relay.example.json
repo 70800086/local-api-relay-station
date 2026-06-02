@@ -45,28 +45,28 @@
       }
     }
   },
-  "order": [
-    "primary-openai",
-    "backup-openai"
-  ],
+  "order": "configured",
   "pricing": {
     "currency": "USD",
+    "default": {
+      "input_per_million_tokens": 0.5,
+      "cached_input_per_million_tokens": 0.05,
+      "output_per_million_tokens": 1.5
+    },
+    "models": {
+      "gpt-5.4-mini": {
+        "input_per_million_tokens": 0.25,
+        "cached_input_per_million_tokens": 0.025,
+        "output_per_million_tokens": 1.0
+      }
+    },
+    "upstream_defaults": {
+      "cached_input_per_million_tokens": 0.06
+    },
     "upstreams": {
-      "primary-openai": {
-        "input_per_million_tokens": 0.5,
-        "cached_input_per_million_tokens": 0.05,
-        "output_per_million_tokens": 1.5,
-        "models": {
-          "gpt-5.4-mini": {
-            "input_per_million_tokens": 0.25,
-            "cached_input_per_million_tokens": 0.025,
-            "output_per_million_tokens": 1.0
-          }
-        }
-      },
+      "primary-openai": {},
       "backup-openai": {
         "input_per_million_tokens": 0.6,
-        "cached_input_per_million_tokens": 0.06,
         "output_per_million_tokens": 1.8
       }
     }

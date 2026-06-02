@@ -305,6 +305,76 @@ class RelayOperatorTests(unittest.TestCase):
             },
         )
 
+    def test_explicit_pricing_uses_global_default_without_upstream_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = write_config(
+                Path(tmp_dir) / "relay-config.json",
+                upstreams={
+                    "primary": {
+                        "base_url": "https://primary.example.com/v1",
+                        "api_key": "primary-key",
+                        "enabled": True,
+                        "transport": {"timeout_seconds": 120},
+                    }
+                },
+                order=["primary"],
+                pricing={
+                    "currency": "USD",
+                    "default": {
+                        "input_per_million_tokens": 2.0,
+                        "cached_input_per_million_tokens": 0.5,
+                        "output_per_million_tokens": 8.0,
+                    },
+                },
+            )
+            config = relay.RelayConfig.load(config_path)
+            store = relay.UsageStore(Path(tmp_dir) / "relay.sqlite3")
+            try:
+                started_at = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+                store.record_request(
+                    started_at=started_at,
+                    finished_at=started_at,
+                    client_id="chat-client",
+                    upstream_id="primary",
+                    requested_model="private-model",
+                    method="POST",
+                    path="/v1/chat/completions",
+                    status_code=200,
+                    forwarded=True,
+                    request_bytes=120,
+                    response_bytes=240,
+                    upstream_ms=15,
+                    error_kind=None,
+                    prompt_tokens=100,
+                    completion_tokens=50,
+                    total_tokens=150,
+                    cached_tokens=40,
+                )
+
+                stats = store.stats_summary(config=config)
+            finally:
+                store.close()
+
+        self.assertEqual(
+            stats["totals"]["usage"]["estimated_cost"],
+            {
+                "currency": "USD",
+                "estimated_requests": 1,
+                "input": 0.00012,
+                "cached_input": 0.00002,
+                "output": 0.0004,
+                "total": 0.00054,
+            },
+        )
+        self.assertEqual(
+            stats["usage_coverage"]["estimated_cost"]["missing_breakdown"],
+            {
+                "missing_pricing_config": 0,
+                "missing_pricing_rule": 0,
+                "missing_prompt_and_completion_tokens": 0,
+            },
+        )
+
     def test_usage_store_summarizes_upstream_costs_within_time_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = write_config(

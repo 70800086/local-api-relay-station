@@ -2805,6 +2805,179 @@ class RelayDefaultModelTests(unittest.TestCase):
         finally:
             config_path.unlink(missing_ok=True)
 
+    def test_config_order_configured_uses_upstream_declaration_order(self) -> None:
+        config_json = json.dumps({
+            "server": {},
+            "local": {"clients": []},
+            "upstreams": {
+                "backup": {
+                    "base_url": "https://backup.example.com/v1",
+                    "api_key": "sk-backup",
+                },
+                "primary": {
+                    "base_url": "https://primary.example.com/v1",
+                    "api_key": "sk-primary",
+                },
+            },
+            "order": "configured",
+        })
+        config_path = Path(tempfile.mkdtemp()) / "relay-config.json"
+        config_path.write_text(config_json)
+        try:
+            config = relay.RelayConfig.load(str(config_path))
+            self.assertEqual(config.order, ["backup", "primary"])
+        finally:
+            config_path.unlink(missing_ok=True)
+
+    def test_config_rejects_unknown_string_order(self) -> None:
+        config_json = json.dumps({
+            "server": {},
+            "local": {"clients": []},
+            "upstreams": {
+                "primary": {
+                    "base_url": "https://primary.example.com/v1",
+                    "api_key": "sk-primary",
+                },
+            },
+            "order": "alphabetical",
+        })
+        config_path = Path(tempfile.mkdtemp()) / "relay-config.json"
+        config_path.write_text(config_json)
+        try:
+            with self.assertRaisesRegex(ValueError, 'order must be a list or "configured"'):
+                relay.RelayConfig.load(str(config_path))
+        finally:
+            config_path.unlink(missing_ok=True)
+
+    def test_config_pricing_default_uses_modern_object_over_legacy_top_level_price(self) -> None:
+        config_json = json.dumps({
+            "server": {},
+            "local": {"clients": []},
+            "upstreams": {
+                "primary": {
+                    "base_url": "https://primary.example.com/v1",
+                    "api_key": "sk-primary",
+                },
+            },
+            "order": ["primary"],
+            "pricing": {
+                "currency": "USD",
+                "input_per_million_tokens": 9.0,
+                "output_per_million_tokens": 18.0,
+                "default": {
+                    "input_per_million_tokens": 1.0,
+                    "cached_input_per_million_tokens": 0.1,
+                    "output_per_million_tokens": 2.0,
+                },
+            },
+        })
+        config_path = Path(tempfile.mkdtemp()) / "relay-config.json"
+        config_path.write_text(config_json)
+        try:
+            config = relay.RelayConfig.load(str(config_path))
+            self.assertIsNotNone(config.pricing)
+            assert config.pricing is not None
+            self.assertEqual(config.pricing.global_default.input_per_million_tokens, relay.Decimal("1.0"))
+            self.assertEqual(config.pricing.global_default.cached_input_per_million_tokens, relay.Decimal("0.1"))
+            self.assertEqual(config.pricing.global_default.output_per_million_tokens, relay.Decimal("2.0"))
+        finally:
+            config_path.unlink(missing_ok=True)
+
+    def test_global_pricing_default_estimates_cost_without_upstream_pricing_entry(self) -> None:
+        pricing = relay.PricingCatalog(
+            currency="USD",
+            upstreams={},
+            global_default=relay.TokenPrice(
+                input_per_million_tokens=relay.Decimal("2.0"),
+                cached_input_per_million_tokens=relay.Decimal("0.5"),
+                output_per_million_tokens=relay.Decimal("8.0"),
+            ),
+        )
+
+        estimated_cost, missing_reason = relay._estimate_row_cost(
+            pricing=pricing,
+            upstream_id="primary",
+            requested_model="private-model",
+            prompt_tokens=100,
+            completion_tokens=50,
+            cached_tokens=40,
+        )
+
+        self.assertIsNone(missing_reason)
+        self.assertEqual(
+            estimated_cost,
+            {
+                "input": relay.Decimal("0.00012"),
+                "cached_input": relay.Decimal("0.00002"),
+                "output": relay.Decimal("0.0004"),
+            },
+        )
+
+    def test_config_merges_pricing_upstream_defaults_recursively(self) -> None:
+        config_json = json.dumps({
+            "server": {},
+            "local": {"clients": []},
+            "upstreams": {
+                "primary": {
+                    "base_url": "https://primary.example.com/v1",
+                    "api_key": "sk-primary",
+                },
+                "backup": {
+                    "base_url": "https://backup.example.com/v1",
+                    "api_key": "sk-backup",
+                },
+            },
+            "order": ["primary", "backup"],
+            "pricing": {
+                "currency": "USD",
+                "upstream_defaults": {
+                    "input_per_million_tokens": 1.0,
+                    "cached_input_per_million_tokens": 0.1,
+                    "output_per_million_tokens": 2.0,
+                    "models": {
+                        "gpt-test": {
+                            "input_per_million_tokens": 3.0,
+                            "output_per_million_tokens": 4.0,
+                        }
+                    },
+                },
+                "upstreams": {
+                    "primary": {},
+                    "backup": {
+                        "output_per_million_tokens": 5.0,
+                        "models": {
+                            "gpt-test": {
+                                "cached_input_per_million_tokens": 0.3,
+                                "output_per_million_tokens": 6.0,
+                            }
+                        },
+                    },
+                },
+            },
+        })
+        config_path = Path(tempfile.mkdtemp()) / "relay-config.json"
+        config_path.write_text(config_json)
+        try:
+            config = relay.RelayConfig.load(str(config_path))
+            self.assertIsNotNone(config.pricing)
+            assert config.pricing is not None
+            primary = config.pricing.upstreams["primary"]
+            backup = config.pricing.upstreams["backup"]
+            self.assertEqual(primary.default_price.input_per_million_tokens, relay.Decimal("1.0"))
+            self.assertEqual(primary.default_price.cached_input_per_million_tokens, relay.Decimal("0.1"))
+            self.assertEqual(primary.default_price.output_per_million_tokens, relay.Decimal("2.0"))
+            self.assertEqual(primary.model_prices["gpt-test"].input_per_million_tokens, relay.Decimal("3.0"))
+            self.assertIsNone(primary.model_prices["gpt-test"].cached_input_per_million_tokens)
+            self.assertEqual(primary.model_prices["gpt-test"].output_per_million_tokens, relay.Decimal("4.0"))
+            self.assertEqual(backup.default_price.input_per_million_tokens, relay.Decimal("1.0"))
+            self.assertEqual(backup.default_price.cached_input_per_million_tokens, relay.Decimal("0.1"))
+            self.assertEqual(backup.default_price.output_per_million_tokens, relay.Decimal("5.0"))
+            self.assertEqual(backup.model_prices["gpt-test"].input_per_million_tokens, relay.Decimal("3.0"))
+            self.assertEqual(backup.model_prices["gpt-test"].cached_input_per_million_tokens, relay.Decimal("0.3"))
+            self.assertEqual(backup.model_prices["gpt-test"].output_per_million_tokens, relay.Decimal("6.0"))
+        finally:
+            config_path.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()

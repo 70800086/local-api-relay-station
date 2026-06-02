@@ -253,7 +253,7 @@ class RelayConfig:
             )
             for upstream_id, raw_upstream in raw_upstreams_payload.items()
         }
-        order_payload = _as_list(payload.get("order"), "order")
+        order_payload = _resolve_order_payload(payload.get("order"), upstreams_payload)
 
         local_clients = [
             LocalClientConfig(
@@ -3949,12 +3949,7 @@ def _resolve_effective_token_price(
     requested_model: Any,
 ) -> tuple[TokenPrice | None, str | None]:
     if pricing is not None:
-        upstream_pricing = pricing.upstreams.get(str(upstream_id or ""))
         builtin_price = _builtin_token_price(requested_model)
-        if upstream_pricing is None:
-            if builtin_price is not None:
-                return builtin_price, None
-            return None, "missing_pricing_config"
         configured_price = _resolve_token_price(
             pricing,
             upstream_id=upstream_id,
@@ -3964,7 +3959,9 @@ def _resolve_effective_token_price(
             return configured_price, None
         if builtin_price is not None:
             return builtin_price, None
-        return None, "missing_pricing_rule"
+        if str(upstream_id or "") in pricing.upstreams or pricing.global_models or pricing.global_default is not None:
+            return None, "missing_pricing_rule"
+        return None, "missing_pricing_config"
     builtin_price = _builtin_token_price(requested_model)
     if builtin_price is not None:
         return builtin_price, None
@@ -4071,6 +4068,14 @@ def _as_list(value: Any, label: str) -> list[Any]:
     return value
 
 
+def _resolve_order_payload(value: Any, upstreams_payload: dict[str, Any]) -> list[Any]:
+    if value == "configured":
+        return list(upstreams_payload.keys())
+    if isinstance(value, str):
+        raise ValueError('order must be a list or "configured"')
+    return _as_list(value, "order")
+
+
 def _coerce_dict(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
@@ -4099,13 +4104,22 @@ def _load_pricing_catalog(
     if raw_pricing is not None:
         pricing_payload = _as_dict(raw_pricing, "pricing")
         upstream_pricing_payload = _coerce_dict(pricing_payload.get("upstreams"))
+        upstream_pricing_defaults = _as_dict(pricing_payload.get("upstream_defaults"), "pricing.upstream_defaults")
         upstreams: dict[str, UpstreamPricing] = {}
         for upstream_id, raw_upstream in upstream_pricing_payload.items():
             upstreams[str(upstream_id)] = _load_upstream_pricing(
-                _as_dict(raw_upstream, f"pricing.upstreams.{upstream_id}")
+                _deep_merge_dicts(
+                    upstream_pricing_defaults,
+                    _as_dict(raw_upstream, f"pricing.upstreams.{upstream_id}"),
+                )
             )
         global_default = None
-        if "input_per_million_tokens" in pricing_payload or "output_per_million_tokens" in pricing_payload:
+        if pricing_payload.get("default") is not None:
+            global_default = _load_token_price(
+                _as_dict(pricing_payload.get("default"), "pricing.default"),
+                "pricing.default",
+            )
+        elif "input_per_million_tokens" in pricing_payload or "output_per_million_tokens" in pricing_payload:
             global_default = _load_token_price(pricing_payload, "pricing default")
         global_models: dict[str, TokenPrice] = {}
         for model_id, raw_model in _coerce_dict(pricing_payload.get("models")).items():
