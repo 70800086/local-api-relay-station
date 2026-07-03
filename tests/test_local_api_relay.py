@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -501,6 +502,32 @@ class RelayPlanningTests(unittest.TestCase):
         self.assertTrue(relay._should_retry_with_fallback(404, "", b"", "gpt-test"))
         self.assertTrue(relay._should_retry_with_fallback(429, "", b"", "gpt-test"))
         self.assertTrue(relay._should_retry_with_fallback(500, "", b"", "gpt-test"))
+
+    def test_should_trip_circuit_breaker_for_auth_and_balance_failures(self) -> None:
+        self.assertTrue(relay._should_trip_circuit_breaker(401))
+        self.assertTrue(relay._should_trip_circuit_breaker(402))
+        self.assertTrue(
+            relay._should_trip_circuit_breaker(
+                403,
+                "application/json",
+                b'{"error":{"message":"Insufficient account balance"}}',
+            )
+        )
+        self.assertTrue(
+            relay._should_trip_circuit_breaker(
+                403,
+                "application/json",
+                b'{"error":{"message":"403 \\u60a8\\u7684\\u5957\\u9910\\u5df2\\u7ecf\\u5230\\u671f\\u6216\\u8005\\u989d\\u5ea6\\u7528\\u5b8c"}}',
+            )
+        )
+        self.assertFalse(
+            relay._should_trip_circuit_breaker(
+                403,
+                "application/json",
+                b'{"error":{"message":"blocked by content policy"}}',
+            )
+        )
+        self.assertFalse(relay._should_trip_circuit_breaker(404))
 
     def test_build_upstream_target_does_not_duplicate_existing_base_path_prefix(self) -> None:
         self.assertEqual(
@@ -2069,6 +2096,82 @@ class LocalApiRelayIntegrationTests(unittest.TestCase):
                 self.assertEqual(stats["totals"]["successes"], 0)
                 self.assertEqual(stats["totals"]["failures"], 2)
 
+    def test_upstream_balance_failures_deprioritize_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
+            relay_port = find_free_port()
+            payload = make_config_payload(
+                listen_port=relay_port,
+                database_path=str(Path(tmp_dir) / "relay.sqlite3"),
+                upstream_base_urls={
+                    "primary": f"http://127.0.0.1:{upstream.port}/primary",
+                    "backup": f"http://127.0.0.1:{upstream.port}/backup",
+                },
+            )
+            config_path = Path(tmp_dir) / "relay-config.json"
+            config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            RecordingUpstreamHandler.queue_responses(
+                {
+                    "status": 403,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": b'{"error":{"message":"Insufficient account balance"}}',
+                },
+                {
+                    "status": 201,
+                    "headers": dict(DEFAULT_UPSTREAM_HEADERS),
+                    "body": DEFAULT_UPSTREAM_BODY,
+                },
+                {
+                    "status": 201,
+                    "headers": dict(DEFAULT_UPSTREAM_HEADERS),
+                    "body": DEFAULT_UPSTREAM_BODY,
+                },
+            )
+
+            with RelayServer(config_path) as relay_server:
+                status, _, response_body = make_request(
+                    relay_port,
+                    "POST",
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=b'{"model":"gpt-test","messages":[]}',
+                )
+                self.assertEqual(status, 201)
+                self.assertEqual(response_body, DEFAULT_UPSTREAM_BODY)
+
+                breaker_snapshot = {
+                    item["upstream_id"]: item
+                    for item in relay_server.runtime_manager.active_runtime().circuit_breaker.snapshot()
+                }
+                self.assertEqual(breaker_snapshot["primary"]["state"], "closed")
+                self.assertEqual(breaker_snapshot["primary"]["priority_tier"], "degraded")
+                self.assertEqual(breaker_snapshot["primary"]["last_failure_status_code"], 403)
+                self.assertEqual(
+                    relay_server.runtime_manager.active_runtime().circuit_breaker.prioritized_upstream_ids(["primary", "backup"]),
+                    ["backup", "primary"],
+                )
+
+                RecordingUpstreamHandler.requests = []
+                status, _, response_body = make_request(
+                    relay_port,
+                    "POST",
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer local-chat-key",
+                        "Content-Type": "application/json",
+                    },
+                    body=b'{"model":"gpt-test","messages":[]}',
+                )
+
+            self.assertEqual(status, 201)
+            self.assertEqual(response_body, DEFAULT_UPSTREAM_BODY)
+            self.assertEqual(
+                [item["path"] for item in RecordingUpstreamHandler.requests],
+                ["/backup/v1/chat/completions"],
+            )
+
     def test_admin_endpoints_require_admin_key_and_invalid_local_key_is_counted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir, UpstreamServer() as upstream:
             relay_port = find_free_port()
@@ -2977,6 +3080,91 @@ class RelayDefaultModelTests(unittest.TestCase):
             self.assertEqual(backup.model_prices["gpt-test"].output_per_million_tokens, relay.Decimal("6.0"))
         finally:
             config_path.unlink(missing_ok=True)
+
+
+class RelayCliTests(unittest.TestCase):
+    def test_parse_args_accepts_test_order_command(self) -> None:
+        args = relay.parse_args(["test-order", "--config", "relay.json"])
+
+        self.assertEqual(args.command, "test-order")
+        self.assertEqual(args.config, "relay.json")
+        self.assertIsNone(args.timeout_seconds)
+
+    def test_main_dispatches_test_order_to_exercise_order_upstreams_with_order_only(self) -> None:
+        with (
+            mock.patch.object(relay, "exercise_upstreams", return_value={"old": True}) as exercise_upstreams,
+            mock.patch.object(relay, "exercise_order_upstreams", return_value={"ok": True}, create=True) as exercise_order_upstreams,
+            mock.patch("builtins.print") as print_mock,
+        ):
+            exit_code = relay.main(["test-order", "--config", "relay.json", "--timeout-seconds", "12"])
+
+        self.assertEqual(exit_code, 0)
+        exercise_order_upstreams.assert_called_once_with(
+            "relay.json",
+            timeout_seconds=12.0,
+        )
+        exercise_upstreams.assert_not_called()
+        print_mock.assert_called_once_with(json.dumps({"ok": True}, ensure_ascii=False))
+
+    def test_exercise_order_upstreams_uses_default_model_without_models_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "relay-config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "server": {
+                            "listen_host": "127.0.0.1",
+                            "listen_port": 0,
+                            "admin_key": "relay-admin",
+                            "database_path": str(Path(tmp_dir) / "relay.sqlite3"),
+                            "idle_window_seconds": 300,
+                            "request_timeout_seconds": 120,
+                        },
+                        "local": {"clients": []},
+                        "upstreams": {
+                            "primary": {
+                                "base_url": "https://primary.example.com/v1",
+                                "api_key": "primary-key",
+                                "enabled": True,
+                                "transport": {"timeout_seconds": 120},
+                            }
+                        },
+                        "order": ["primary"],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(relay, "_fetch_models") as fetch_models,
+                mock.patch.object(
+                    relay,
+                    "_perform_real_request",
+                    return_value={
+                        "attempted": True,
+                        "success": True,
+                        "status_code": 200,
+                        "error_kind": None,
+                        "error": None,
+                        "latency_ms": 5,
+                        "mode": "chat.completions",
+                        "path": "/chat/completions",
+                        "model": "default",
+                        "reply_preview": "pong",
+                        "usage": None,
+                        "attempts": 1,
+                        "compatibility_retry": None,
+                    },
+                ) as perform_real_request,
+            ):
+                payload = relay.exercise_order_upstreams(str(config_path), timeout_seconds=9)
+
+        fetch_models.assert_not_called()
+        perform_real_request.assert_called_once()
+        self.assertEqual(payload["summary"], {"total": 1, "models_successes": 1, "request_successes": 1, "failures": 0})
+        self.assertEqual(payload["upstreams"][0]["models"]["selected_model"], "default")
+        self.assertEqual(payload["upstreams"][0]["request"]["mode"], "chat.completions")
 
 
 if __name__ == "__main__":

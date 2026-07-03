@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import http.client
 import json
@@ -79,6 +80,19 @@ CHAT_COMPLETIONS_FALLBACK_ERROR_MARKERS = (
     "use /responses",
     "responses endpoint",
     "responses api",
+)
+HARD_FAILURE_ERROR_MARKERS = (
+    "insufficient balance",
+    "insufficient account balance",
+    "quota",
+    "credit balance",
+    "billing",
+    "api key",
+    "invalid key",
+    "authentication",
+    "unauthorized",
+    "额度",
+    "套餐",
 )
 NON_TEXT_MODEL_MARKERS = (
     "embedding",
@@ -1939,7 +1953,11 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         cached_tokens=cached_tokens,
                         **_request_observability_kwargs(attempt_request_body),
                     )
-                    if _should_trip_circuit_breaker(int(response.status)):
+                    if _should_trip_circuit_breaker(
+                        int(response.status),
+                        response.getheader("Content-Type", ""),
+                        captured_body,
+                    ):
                         breaker_lease.mark_failure(
                             error_kind="upstream_status",
                             status_code=int(response.status),
@@ -2747,8 +2765,17 @@ def _should_retry_with_fallback(
     return status_code >= 400
 
 
-def _should_trip_circuit_breaker(status_code: int) -> bool:
-    return status_code >= 500 or status_code in {408, 409, 425, 429}
+def _should_trip_circuit_breaker(
+    status_code: int,
+    content_type: str = "",
+    response_body: bytes = b"",
+) -> bool:
+    if status_code >= 500 or status_code in {401, 402, 408, 409, 425, 429}:
+        return True
+    if status_code != 403:
+        return False
+    error_text = (_extract_error_message(content_type, response_body) or response_body.decode("utf-8", errors="replace")).lower()
+    return any(marker in error_text for marker in HARD_FAILURE_ERROR_MARKERS)
 
 
 def _is_empty_chat_response_body(body: bytes) -> bool:
@@ -3362,6 +3389,12 @@ def _extract_error_message(content_type: str, body: bytes) -> str:
     snippet = body[:CAPTURE_BODY_LIMIT]
     if not snippet:
         return ""
+    # Decompress gzip if the upstream returned compressed error body.
+    if snippet[:2] == b'\x1f\x8b':
+        try:
+            snippet = gzip.decompress(snippet)
+        except Exception:
+            snippet = b''
     try:
         text = snippet.decode("utf-8", errors="replace")
     except Exception:
@@ -3549,6 +3582,12 @@ def _extract_usage_metrics(content_type: str, body: bytes) -> tuple[int | None, 
 def _extract_usage_payload(content_type: str, body: bytes) -> dict[str, Any] | None:
     if not body:
         return None
+    # Decompress gzip if the upstream returned a compressed body.
+    if body[:2] == b'\x1f\x8b':
+        try:
+            body = gzip.decompress(body)
+        except Exception:
+            return None
     normalized = content_type.lower()
     if "application/json" in normalized:
         try:
@@ -4401,6 +4440,31 @@ def exercise_upstreams(
     }
 
 
+def exercise_order_upstreams(
+    config_path: str | Path,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    resolved_config_path = Path(config_path).expanduser().resolve()
+    config = RelayConfig.load(resolved_config_path)
+    targets = _select_order_upstreams(config)
+    results = _parallel_map(
+        targets,
+        lambda upstream: _exercise_order_upstream(upstream, timeout_seconds=timeout_seconds),
+    )
+    return {
+        "config_path": str(resolved_config_path),
+        "selected_upstream_ids": [target.upstream_id for target in targets],
+        "summary": {
+            "total": len(results),
+            "models_successes": sum(1 for item in results if bool(item["models"]["success"])),
+            "request_successes": sum(1 for item in results if bool(item["request"]["success"])),
+            "failures": sum(1 for item in results if not bool(item["success"])),
+        },
+        "upstreams": results,
+    }
+
+
 def _select_operator_upstreams(
     config: RelayConfig,
     *,
@@ -4434,6 +4498,19 @@ def _select_operator_upstreams(
             continue
         ordered_upstreams.append(upstreams_by_id[upstream_id])
     return [upstream for upstream in ordered_upstreams if upstream.enabled]
+
+
+def _select_order_upstreams(config: RelayConfig) -> list[UpstreamConfig]:
+    upstreams_by_id = config.upstreams_by_id
+    ordered_upstreams: list[UpstreamConfig] = []
+    seen_ids: set[str] = set()
+    for upstream_id in config.order:
+        upstream = upstreams_by_id.get(upstream_id)
+        if upstream is None or upstream_id in seen_ids or not upstream.enabled:
+            continue
+        ordered_upstreams.append(upstream)
+        seen_ids.add(upstream_id)
+    return ordered_upstreams
 
 
 def _parallel_map(
@@ -4720,6 +4797,71 @@ def _exercise_upstream(
         "success": bool(models_result["success"]) and bool(request_result["success"]),
         "latency_ms": int(models_result["latency_ms"]) + int(request_result["latency_ms"]),
         "models": models_result,
+        "request": request_result,
+        }
+
+
+def _exercise_order_upstream(
+    upstream: UpstreamConfig,
+    *,
+    timeout_seconds: float | None,
+) -> dict[str, Any]:
+    if not upstream.enabled:
+        return {
+            "upstream_id": upstream.upstream_id,
+            "base_url": upstream.base_url,
+            "enabled": False,
+            "success": False,
+            "latency_ms": 0,
+            "models": {
+                "success": False,
+                "status_code": None,
+                "error_kind": "disabled",
+                "error": "upstream is disabled in relay config",
+                "latency_ms": 0,
+                "count": None,
+                "preview": [],
+                "selected_model": None,
+            },
+            "request": {
+                "attempted": False,
+                "success": False,
+                "status_code": None,
+                "error_kind": "disabled",
+                "error": "upstream is disabled in relay config",
+                "latency_ms": 0,
+                "mode": None,
+                "path": None,
+                "model": None,
+                "reply_preview": None,
+                "usage": None,
+                "attempts": 0,
+                "compatibility_retry": None,
+            },
+        }
+
+    requested_model = _resolve_upstream_model_name("default", upstream) or "default"
+    request_result = _perform_real_request(
+        upstream,
+        model=requested_model,
+        timeout_seconds=timeout_seconds,
+    )
+    return {
+        "upstream_id": upstream.upstream_id,
+        "base_url": upstream.base_url,
+        "enabled": upstream.enabled,
+        "success": bool(request_result["success"]),
+        "latency_ms": int(request_result["latency_ms"]),
+        "models": {
+            "success": True,
+            "status_code": None,
+            "error_kind": None,
+            "error": None,
+            "latency_ms": 0,
+            "count": None,
+            "preview": [],
+            "selected_model": requested_model,
+        },
         "request": request_result,
     }
 
@@ -5815,7 +5957,7 @@ def _stringify_error(error: Any) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     raw_args = list(sys.argv[1:] if argv is None else argv)
-    known_commands = {"serve", "probe", "credits", "test"}
+    known_commands = {"serve", "probe", "credits", "test", "test-order"}
     if not raw_args or raw_args[0] not in known_commands:
         raw_args = ["serve", *raw_args]
 
@@ -5840,6 +5982,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     test_parser.add_argument("--config", required=True, help="Path to relay config JSON")
     test_parser.add_argument("--upstream-id", dest="upstream_ids", action="append", default=None)
     test_parser.add_argument("--timeout-seconds", type=float, default=None)
+
+    test_order_parser = subparsers.add_parser("test-order", help="Run real-request tests for configured order only")
+    test_order_parser.add_argument("--config", required=True, help="Path to relay config JSON")
+    test_order_parser.add_argument("--timeout-seconds", type=float, default=None)
 
     return parser.parse_args(raw_args)
 
@@ -5874,6 +6020,13 @@ def main(argv: list[str] | None = None) -> int:
         payload = exercise_upstreams(
             args.config,
             upstream_ids=args.upstream_ids,
+            timeout_seconds=args.timeout_seconds,
+        )
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "test-order":
+        payload = exercise_order_upstreams(
+            args.config,
             timeout_seconds=args.timeout_seconds,
         )
         print(json.dumps(payload, ensure_ascii=False))

@@ -10,3 +10,4 @@ tmp/
 
 # Secrets - contains API keys
 local_api_relay.json
+local_api_relay.json.bak*

@@ -710,6 +710,7 @@ python3 local_api_relay.py credits --config local_api_relay.json --upstream-id c
 ```bash
 python3 local_api_relay.py test --config local_api_relay.json
 python3 local_api_relay.py test --config local_api_relay.json --upstream-id shenfeng
+python3 local_api_relay.py test-order --config local_api_relay.json
 ```
 
 行为：
@@ -719,3 +720,10 @@ python3 local_api_relay.py test --config local_api_relay.json --upstream-id shen
 - `gpt-5/gpt-4.1/o1/o3/o4` 族优先走 `/responses`
 - 其他模型优先走 `/chat/completions`
 - 如果遇到兼容性报错，会在少量已知场景下自动重试（例如 `responses -> chat/completions`，或 `chat/completions` 补 `stream=true`）
+
+补充：
+
+- `test` 在不传 `--upstream-id` 时，会先按 `order`，再补上其他 enabled upstream
+- `test-order` 只测试配置里的 `order`，不会补上额外 upstream，更适合日常检查当前路由链
+- `test-order` 不会先探测 `/models`；它会直接使用每个 upstream 的 `default_model`
+- 如果 upstream 没配 `default_model`，就直接用字面量 `default` 测试

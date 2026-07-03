@@ -124,6 +124,31 @@ class RealRequestHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(content_length)
         self.__class__.requests.append((self.command, self.path, body))
+        if self.path == "/primary/v1/chat/completions":
+            payload = json.dumps(
+                {
+                    "id": "chat_123",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "pong"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 3,
+                        "total_tokens": 5,
+                    },
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.path == "/primary/v1/responses":
             payload = json.dumps(
                 {
@@ -849,5 +874,53 @@ class RelayOperatorTests(unittest.TestCase):
             [
                 ("GET", "/primary/v1/models", b""),
                 ("POST", "/primary/v1/responses", b'{"model": "gpt-5-mini", "input": "Reply with: pong", "max_output_tokens": 16}'),
+            ],
+        )
+
+    def test_cli_test_order_uses_default_model_without_models_probe(self) -> None:
+        RealRequestHandler.reset()
+        with tempfile.TemporaryDirectory() as tmp_dir, HttpServerHarness(RealRequestHandler) as server:
+            config_path = write_config(
+                Path(tmp_dir) / "relay-config.json",
+                upstreams={
+                    "primary": {
+                        "base_url": f"http://127.0.0.1:{server.port}/primary/v1",
+                        "api_key": "primary-key",
+                        "enabled": True,
+                        "transport": {"timeout_seconds": 7},
+                    }
+                },
+                order=["primary"],
+            )
+            stdout = StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = relay.main(["test-order", "--config", str(config_path)])
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            payload["summary"],
+            {
+                "total": 1,
+                "models_successes": 1,
+                "request_successes": 1,
+                "failures": 0,
+            },
+        )
+        self.assertEqual(payload["upstreams"][0]["models"]["selected_model"], "default")
+        self.assertEqual(payload["upstreams"][0]["request"]["mode"], "chat.completions")
+        self.assertEqual(payload["upstreams"][0]["request"]["reply_preview"], "pong")
+        self.assertEqual(
+            payload["upstreams"][0]["request"]["usage"],
+            {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+        )
+        self.assertEqual(
+            RealRequestHandler.requests,
+            [
+                (
+                    "POST",
+                    "/primary/v1/chat/completions",
+                    b'{"model": "default", "messages": [{"role": "user", "content": "Reply with: pong"}], "max_tokens": 16}',
+                )
             ],
         )
